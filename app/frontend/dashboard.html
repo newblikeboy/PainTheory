@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sensible Algo Admin Console</title>
+  <link rel="stylesheet" href="/ui/static/styles.css">
+</head>
+<body class="dashboard-body">
+  <div class="ambient-glow ambient-a"></div>
+  <div class="ambient-glow ambient-b"></div>
+
+  <header class="mobile-topbar" aria-label="Admin console header">
+    <button id="sidebar-toggle" class="hamburger" type="button" aria-label="Open menu" aria-controls="app-sidebar" aria-expanded="false">
+      <span></span>
+      <span></span>
+      <span></span>
+    </button>
+    <p class="mobile-brand">Sensible Algo Admin</p>
+    <div class="profile-wrap" id="profile-wrap">
+      <button id="profile-toggle-btn" class="profile-btn" type="button" aria-label="Open profile menu" aria-haspopup="true" aria-expanded="false">
+        <span id="profile-avatar-text">A</span>
+      </button>
+      <div id="profile-menu" class="profile-menu" hidden>
+        <button id="profile-logout-btn" class="ghost-btn" type="button">Logout</button>
+      </div>
+    </div>
+  </header>
+
+  <div class="dashboard-shell">
+    <aside id="app-sidebar" class="sidebar" aria-label="Dashboard sidebar">
+      <div class="sidebar-head">
+        <div>
+          <p class="mini-label">Sensible Algo</p>
+          <h2>Admin Console</h2>
+        </div>
+        <button id="sidebar-close" class="icon-btn" type="button" aria-label="Close menu">&times;</button>
+      </div>
+
+      <p class="user-line" id="user-line">Checking session...</p>
+
+      <div class="status-stack">
+        <div class="status-pill" id="api-status">API: checking</div>
+        <div class="status-pill" id="stream-status">State: waiting</div>
+        <div class="status-pill" id="ready-status">Ready: checking</div>
+        <p class="small ready-summary" id="ready-summary">Pre-open checks pending.</p>
+      </div>
+
+      <nav class="side-nav" aria-label="Sections">
+        <button type="button" class="side-nav-btn is-active" data-view-target="home" data-nav-close>Overview</button>
+        <button type="button" class="side-nav-btn" data-view-target="confidence" data-nav-close>Confidence</button>
+        <button type="button" class="side-nav-btn" data-view-target="chart" data-nav-close>Live Chart</button>
+        <button type="button" class="side-nav-btn" data-view-target="paper" data-nav-close>Paper Trades</button>
+        <button type="button" class="side-nav-btn" data-view-target="lotconfig" data-nav-close>Lot Settings</button>
+        <button type="button" class="side-nav-btn" data-view-target="backtest" data-nav-close>Backtest</button>
+        <button type="button" class="side-nav-btn" data-view-target="retrain" data-nav-close>Retrain Status</button>
+        <button type="button" class="side-nav-btn" data-view-target="fyers" data-nav-close>FYERS Auth</button>
+        <button type="button" class="side-nav-btn" data-view-target="insights" data-nav-close>AI Insights</button>
+      </nav>
+
+      <div class="sidebar-actions">
+        <a class="ghost-btn" href="/">Landing</a>
+        <button id="logout-btn" class="ghost-btn" type="button">Logout</button>
+      </div>
+    </aside>
+
+    <div id="sidebar-overlay" class="sidebar-overlay" aria-hidden="true"></div>
+
+    <main class="board-main">
+      <section class="portal-view is-active" data-view="home">
+        <header id="overview" class="board-header card">
+          <div>
+            <p class="label">Live Runtime View</p>
+            <h1>Sensible Algo Admin Console</h1>
+            <p class="subtitle">Real-time phase shifts, pressure profile, and execution context in one operator dashboard.</p>
+          </div>
+        </header>
+
+        <section class="grid top-grid">
+          <article class="card stat-card">
+            <p class="label">Pain Phase</p>
+            <h2 id="pain-phase">comfort</h2>
+          </article>
+          <article class="card stat-card">
+            <p class="label">Dominant Group</p>
+            <h2 id="dominant-group">none</h2>
+          </article>
+          <article class="card stat-card">
+            <p class="label">Next Likely Group</p>
+            <h2 id="next-group">none</h2>
+          </article>
+          <article class="card stat-card">
+            <p class="label">Guidance</p>
+            <h2 id="guidance">observe</h2>
+          </article>
+        </section>
+      </section>
+
+      <section class="portal-view" data-view="confidence" hidden>
+        <section id="confidence-zone" class="grid mid-grid">
+          <article class="card confidence-card">
+            <div class="line-head">
+              <p class="label">Confidence</p>
+              <p class="mono" id="confidence-text">0%</p>
+            </div>
+            <div class="meter">
+              <div class="meter-fill" id="confidence-fill"></div>
+            </div>
+            <p class="small" id="last-update">No runtime timestamp yet</p>
+          </article>
+
+          <article class="card timeline-card">
+            <div class="line-head">
+              <p class="label">Phase Timeline</p>
+              <button id="clear-log" class="ghost-btn" type="button">Clear</button>
+            </div>
+            <ul id="timeline" class="timeline"></ul>
+          </article>
+        </section>
+      </section>
+
+      <section class="portal-view" data-view="chart" hidden>
+        <section id="chart-zone" class="grid chart-grid">
+          <article class="card chart-card">
+            <div class="line-head chart-head">
+              <p class="label">Live Price Chart</p>
+              <div class="chart-controls">
+                <button id="tf-1m" class="ghost-btn tf-btn is-active" type="button">1m Execution</button>
+                <button id="tf-5m" class="ghost-btn tf-btn" type="button">5m Analysis</button>
+              </div>
+            </div>
+            <p class="small" id="chart-status">Loading chart...</p>
+            <div id="live-chart" class="live-chart"></div>
+          </article>
+        </section>
+      </section>
+
+      <section class="portal-view" data-view="paper" hidden>
+        <section id="paper-zone" class="grid paper-grid">
+          <article class="card">
+            <div class="line-head">
+              <p class="label">Paper Trading</p>
+              
+            </div>
+            <p class="small" id="paper-backend">Backend: loading...</p>
+            <div class="paper-kpis">
+              <div class="paper-kpi">
+                <span class="kpi-label">Closed</span>
+                <span class="kpi-value" id="paper-closed">0</span>
+              </div>
+              <div class="paper-kpi">
+                <span class="kpi-label">Profit</span>
+                <span class="kpi-value" id="paper-profit">0</span>
+              </div>
+              <div class="paper-kpi">
+                <span class="kpi-label">Loss</span>
+                <span class="kpi-value" id="paper-loss">0</span>
+              </div>
+              <div class="paper-kpi">
+                <span class="kpi-label">Win Rate</span>
+                <span class="kpi-value" id="paper-winrate">0%</span>
+              </div>
+              <div class="paper-kpi">
+                <span class="kpi-label">Net</span>
+                <span class="kpi-value" id="paper-net">0.00</span>
+              </div>
+            </div>
+            <p class="small" id="paper-active-trade">No active paper trade.</p>
+            <div class="paper-diagnostics">
+              <div class="line-head">
+                <p class="label">Entry Gate Diagnostics</p>
+                <p class="small mono" id="paper-gate-last">Last gate: --</p>
+              </div>
+              <div id="paper-gate-list" class="feature-list">
+                <p class="small">No diagnostics yet.</p>
+              </div>
+            </div>
+          </article>
+
+          <article class="card">
+            <p class="label">Recent Paper Trades</p>
+            <div class="paper-table-wrap paper-trades-wrap">
+              <table class="paper-table paper-trades-table">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Side</th>
+                    <th>Contract</th>
+                    <th>Entry (IST)</th>
+                    <th>Exit (IST)</th>
+                    <th>Pts</th>
+                    <th>Outcome</th>
+                  </tr>
+                </thead>
+                <tbody id="paper-trades-body">
+                  <tr><td colspan="7" class="small">No paper trades yet.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+      </section>
+
+      <section class="portal-view" data-view="lotconfig" hidden>
+        <section class="grid paper-grid">
+          <article class="card">
+            <div class="line-head">
+              <p class="label">Execution Lot Size</p>
+            </div>
+            <p class="small">Set current lot size quantity used for both paper and live quantity math.</p>
+            <div class="backtest-form">
+              <label class="field">
+                <span>Lot Size Quantity</span>
+                <input id="admin-lot-size-input" class="text-input" type="number" min="1" step="1" value="1">
+              </label>
+            </div>
+            <div class="action-row">
+              <button id="admin-lot-size-save-btn" class="action-btn" type="button">Save Lot Size</button>
+            </div>
+            <p id="admin-lot-size-current" class="small mono">Current lot size: --</p>
+            <p id="admin-lot-size-msg" class="small">Not loaded yet.</p>
+          </article>
+        </section>
+      </section>
+
+      <section class="portal-view" data-view="backtest" hidden>
+        <section id="backtest-zone" class="grid backtest-grid">
+          <article class="card">
+            <div class="line-head">
+              <p class="label">Backtest Engine</p>
+              <div class="action-row">
+                <button id="backtest-run-btn" class="action-btn" type="button">Run Backtest</button>
+                <button id="backtest-load-btn" class="ghost-btn" type="button">Load Last Run</button>
+              </div>
+            </div>
+            <p class="small">Runs AI + paper execution logic on DB candles/options for selected IST window.</p>
+            <div class="backtest-form">
+              <label class="field">
+                <span>Start (IST)</span>
+                <input id="backtest-start" class="text-input" type="date">
+              </label>
+              <label class="field">
+                <span>End (IST)</span>
+                <input id="backtest-end" class="text-input" type="date">
+              </label>
+              <label class="field">
+                <span>Max Candles</span>
+                <input id="backtest-max-candles" class="text-input" type="number" min="500" step="100" value="120000">
+              </label>
+              <label class="field">
+                <span>Max Trades in Output</span>
+                <input id="backtest-max-trades" class="text-input" type="number" min="100" step="50" value="1000">
+              </label>
+            </div>
+            <p class="small">Pain release gate: disabled (execution is always release-off).</p>
+            <label class="field backtest-checkbox">
+              <span>Close Open Trade At End</span>
+              <input id="backtest-close-open" type="checkbox" checked>
+            </label>
+            <div class="backtest-progress">
+              <div class="meter backtest-meter">
+                <div id="backtest-progress-fill" class="meter-fill"></div>
+              </div>
+              <p id="backtest-progress-text" class="small">Progress: 0%</p>
+            </div>
+            <pre id="backtest-status" class="tiny-log">Backtest not run yet.</pre>
+          </article>
+
+          <article class="card backtest-summary-card">
+            <p class="label">Backtest Summary</p>
+            <div class="backtest-summary-scroll">
+              <div class="paper-kpis backtest-kpis">
+                <div class="paper-kpi"><span class="kpi-label">Trades</span><span class="kpi-value" id="backtest-count">0</span></div>
+                <div class="paper-kpi"><span class="kpi-label">Win Rate</span><span class="kpi-value" id="backtest-winrate">0%</span></div>
+                <div class="paper-kpi"><span class="kpi-label">Net PnL</span><span class="kpi-value" id="backtest-net">0.00</span></div>
+                <div class="paper-kpi"><span class="kpi-label">Profit Factor</span><span class="kpi-value" id="backtest-profit-factor">--</span></div>
+                <div class="paper-kpi"><span class="kpi-label">Max DD</span><span class="kpi-value" id="backtest-maxdd">0.00</span></div>
+                <div class="paper-kpi"><span class="kpi-label">Wins</span><span class="kpi-value" id="backtest-win">0</span></div>
+                <div class="paper-kpi"><span class="kpi-label">Losses</span><span class="kpi-value" id="backtest-loss">0</span></div>
+                <div class="paper-kpi"><span class="kpi-label">Flats</span><span class="kpi-value" id="backtest-flat">0</span></div>
+                <div class="paper-kpi"><span class="kpi-label">Long</span><span class="kpi-value" id="backtest-long">0</span></div>
+                <div class="paper-kpi"><span class="kpi-label">Short</span><span class="kpi-value" id="backtest-short">0</span></div>
+                <div class="paper-kpi"><span class="kpi-label">Gross Profit</span><span class="kpi-value" id="backtest-gross-profit">0.00</span></div>
+                <div class="paper-kpi"><span class="kpi-label">Gross Loss</span><span class="kpi-value" id="backtest-gross-loss">0.00</span></div>
+              </div>
+              <p class="small">Close reasons:</p>
+              <div id="backtest-reason-list" class="feature-list"></div>
+              <div class="paper-table-wrap">
+                <table class="paper-table">
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Side</th>
+                      <th>Entry (IST)</th>
+                      <th>Exit (IST)</th>
+                      <th>Pts</th>
+                      <th>Outcome</th>
+                      <th>Reason</th>
+                    </tr>
+                  </thead>
+                  <tbody id="backtest-trades-body">
+                    <tr><td colspan="7" class="small">No backtest trades yet.</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </article>
+        </section>
+      </section>
+
+      <section class="portal-view" data-view="retrain" hidden>
+        <section id="retrain-zone" class="grid backtest-grid">
+          <article class="card">
+            <div class="line-head">
+              <p class="label">Auto Retrain Status</p>
+              <button id="retrain-refresh-btn" class="ghost-btn" type="button">Refresh</button>
+            </div>
+            <pre id="retrain-status-view" class="tiny-log">Retrain status not loaded.</pre>
+          </article>
+
+          <article class="card">
+            <div class="line-head">
+              <p class="label">Retrain Learning History</p>
+              <p class="small">Daily runs with what AI learned or why it did not learn.</p>
+            </div>
+            <div class="paper-table-wrap">
+              <table class="paper-table">
+                <thead>
+                  <tr>
+                    <th>Date (IST)</th>
+                    <th>Trigger</th>
+                    <th>Status</th>
+                    <th>Deployed</th>
+                    <th>Rows</th>
+                    <th>Learning / Reason</th>
+                  </tr>
+                </thead>
+                <tbody id="retrain-history-body">
+                  <tr><td colspan="6" class="small">No retrain history yet.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="line-head">
+              <p class="label">Mistake Bucket PnL (Paper)</p>
+              <p class="small">Category-wise performance for recent closed trades.</p>
+            </div>
+            <pre id="retrain-mistake-summary" class="tiny-log">Mistake analytics not loaded.</pre>
+            <div class="paper-table-wrap">
+              <table class="paper-table">
+                <thead>
+                  <tr>
+                    <th>Bucket</th>
+                    <th>Trades</th>
+                    <th>Win %</th>
+                    <th>Net Pts</th>
+                    <th>Avg Pts</th>
+                    <th>Avg Score</th>
+                    <th>Top Reason</th>
+                  </tr>
+                </thead>
+                <tbody id="retrain-mistake-body">
+                  <tr><td colspan="7" class="small">No mistake analytics yet.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+      </section>
+
+      <section class="portal-view" data-view="fyers" hidden>
+        <section id="fyers-zone" class="grid fyers-grid">
+          <article class="card">
+            <div class="line-head">
+              <p class="label">FYERS Auth</p>
+              <button id="fyers-status-btn" class="ghost-btn" type="button">Check Status</button>
+            </div>
+            <div class="action-row">
+              <button id="fyers-url-btn" class="action-btn" type="button">Open Login URL</button>
+              <button id="fyers-refresh-btn" class="ghost-btn" type="button">Refresh Token</button>
+            </div>
+            <label class="field">
+              <span>Auth Code (from redirect URL)</span>
+              <input id="fyers-auth-code" class="text-input" type="text" placeholder="Paste auth code">
+            </label>
+            <div class="action-row">
+              <button id="fyers-exchange-btn" class="action-btn" type="button">Exchange Auth Code</button>
+            </div>
+            <pre id="fyers-status-view" class="tiny-log">FYERS status not loaded.</pre>
+            <pre id="fyers-msg" class="tiny-log">Ready</pre>
+          </article>
+        </section>
+      </section>
+
+      <section class="portal-view" data-view="insights" hidden>
+        <section id="insights-zone" class="grid bottom-grid">
+          <article class="card">
+            <p class="label">Explanation</p>
+            <pre id="explanation" class="explanation">Waiting for enough rolling data...</pre>
+          </article>
+          <article class="card">
+            <p class="label">Feature Pressure (Top 8)</p>
+            <div id="feature-list" class="feature-list"></div>
+          </article>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+  <script src="/ui/static/app.js"></script>
+</body>
+</html>

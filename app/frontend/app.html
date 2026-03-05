@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sensible Algo User Console</title>
+  <link rel="stylesheet" href="/ui/static/styles.css">
+  <link rel="stylesheet" href="/ui/static/user-console.css">
+</head>
+<body class="dashboard-body user-console">
+  <div class="ambient-glow ambient-a"></div>
+  <div class="ambient-glow ambient-b"></div>
+  <div class="user-noise"></div>
+
+  <header class="mobile-topbar" aria-label="User console header">
+    <button id="sidebar-toggle" class="hamburger" type="button" aria-label="Open menu" aria-controls="app-sidebar" aria-expanded="false">
+      <span></span>
+      <span></span>
+      <span></span>
+    </button>
+    <p class="mobile-brand">Sensible Algo</p>
+    <div class="topbar-actions">
+      <button id="subscribe-modal-open-btn" class="subscribe-top-btn" type="button">Subscribe</button>
+      <div class="profile-wrap" id="profile-wrap">
+        <button id="profile-toggle-btn" class="profile-btn" type="button" aria-label="Open profile menu" aria-haspopup="true" aria-expanded="false">
+          <span id="profile-avatar-text">U</span>
+        </button>
+        <div id="profile-menu" class="profile-menu" hidden>
+          <button id="profile-logout-btn" class="ghost-btn" type="button">Logout</button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <div class="dashboard-shell">
+    <aside id="app-sidebar" class="sidebar" aria-label="Dashboard sidebar">
+      <div class="sidebar-head">
+        <div>
+          <p class="mini-label">Sensible Algo</p>
+        </div>
+        <button id="sidebar-close" class="icon-btn" type="button" aria-label="Close menu">&times;</button>
+      </div>
+
+      <nav class="side-nav" aria-label="Sections">
+        <button type="button" class="side-nav-btn is-active" data-view-target="home" data-nav-close>Home</button>
+        <button type="button" class="side-nav-btn" data-view-target="broker" data-nav-close>Broker</button>
+        <button type="button" class="side-nav-btn" data-view-target="report" data-nav-close>Report</button>
+        <button type="button" class="side-nav-btn" data-view-target="profile" data-nav-close>My Profile</button>
+        <button type="button" class="side-nav-btn" data-view-target="helpdesk" data-nav-close>Helpdesk</button>
+      </nav>
+    </aside>
+
+    <div id="sidebar-overlay" class="sidebar-overlay" aria-hidden="true"></div>
+
+    <main class="board-main">
+      <section class="portal-view is-active" data-view="home">
+        <header id="overview" class="home-head card">
+          <div>
+            <p class="label">Home</p>
+            <h1>Control Center</h1>
+            <p class="subtitle">Connect broker flow, track trade status, and monitor live paper performance.</p>
+          </div>
+        </header>
+
+        <section class="home-grid">
+          <article class="card home-card control-card">
+            <div class="line-head">
+              <h2>Broker Control</h2>
+            </div>
+            <p class="small">Use terminal login to connect your broker. Enable trading engine for live execution.</p>
+            <div class="switch-list">
+              <div class="switch-row">
+                <span>Terminal Login</span>
+                <button
+                  id="terminal-login-toggle"
+                  class="toggle-switch is-off"
+                  type="button"
+                  role="switch"
+                  aria-checked="false"
+                  aria-label="Toggle terminal login"
+                >
+                  Off
+                </button>
+              </div>
+              <div class="switch-row">
+                <span>Trading Engine</span>
+                <button
+                  id="trading-engine-toggle"
+                  class="toggle-switch is-off"
+                  type="button"
+                  role="switch"
+                  aria-checked="false"
+                  aria-label="Toggle trading engine"
+                >
+                  Off
+                </button>
+              </div>
+            </div>
+            <p id="trading-engine-msg" class="small">Trading engine is off. Only paper flow is active.</p>
+            
+          </article>
+
+          <article class="card home-card pnl-card">
+            <div class="line-head">
+              <h2>Profit &amp; Loss</h2>
+              <span class="realtime-pill">Realtime</span>
+            </div>
+           
+            <div class="kpi-grid-home">
+              <div class="kpi-box"><span>Total PnL</span><strong id="paper-net">0.00</strong></div>
+              <div class="kpi-box"><span>Profitable</span><strong id="paper-profit">0</strong></div>
+              <div class="kpi-box"><span>Loss</span><strong id="paper-loss">0</strong></div>
+              <div class="kpi-box"><span>Closed</span><strong id="paper-closed">0</strong></div>
+              <div class="kpi-box"><span>Win Rate</span><strong id="paper-winrate">0%</strong></div>
+            </div>
+          </article>
+
+          <article class="card home-card active-card">
+            <div class="line-head">
+              <h2>Active Trade</h2>
+           
+            </div>
+            <p class="small" id="paper-active-trade">No active paper trade.</p>
+          </article>
+
+          <article class="card home-card trades-card">
+            <div class="line-head">
+              <h2>Closed Trades</h2>
+              
+            </div>
+            <div class="paper-table-wrap compact-table paper-trades-wrap">
+              <table class="paper-table paper-trades-table">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Side</th>
+                    <th>Contract</th>
+                    <th>Entry</th>
+                    <th>Exit</th>
+                    <th>Pts</th>
+                    <th>Outcome</th>
+                  </tr>
+                </thead>
+                <tbody id="paper-trades-body">
+                  <tr><td colspan="7" class="small">No paper trades yet.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+      </section>
+
+      <section class="portal-view" data-view="broker" hidden>
+        <article class="card view-card">
+          <div class="line-head">
+            <h2>Broker - Angel One</h2>
+            <span class="small">Client ID Setup</span>
+          </div>
+          <p class="small">Add or update your Angel One Client ID. You can change it anytime.</p>
+          <div class="broker-card">
+            <div class="profile-row">
+              <span>Saved Client ID</span>
+              <strong id="broker-client-id-value">Not set</strong>
+            </div>
+            <label class="field">
+              <span>Angel One Client ID</span>
+              <input id="broker-client-id-input" class="text-input" type="text" placeholder="Enter client id">
+            </label>
+            <div class="action-row">
+              <button id="broker-client-id-save-btn" class="action-btn" type="button">Save / Update</button>
+            </div>
+            <p id="broker-client-id-msg" class="small">Client ID not loaded yet.</p>
+          </div>
+        </article>
+      </section>
+
+      <section class="portal-view" data-view="report" hidden>
+        <article class="card view-card">
+          <div class="line-head">
+            <h2>AI Trade Report</h2>
+            <button id="report-load-btn" class="action-btn" type="button">Load Report</button>
+          </div>
+          <p class="small">View AI-generated paper trades and your personal live trades dispatched to your account. Maximum range is 90 days.</p>
+          <div class="report-filter-grid">
+            <label class="field">
+              <span>Start Date</span>
+              <input id="report-start-date" class="text-input" type="date">
+            </label>
+            <label class="field">
+              <span>End Date</span>
+              <input id="report-end-date" class="text-input" type="date">
+            </label>
+            <label class="field">
+              <span>Mode</span>
+              <select id="report-mode-select" class="text-input">
+                <option value="all">All (Paper + Live)</option>
+                <option value="paper">Paper Trades</option>
+                <option value="live">My Live Trades</option>
+              </select>
+            </label>
+          </div>
+          <p id="report-status" class="small">Select a date range and click Load Report.</p>
+          <p id="report-count" class="small mono">Trades: 0</p>
+          <div class="paper-table-wrap">
+            <table class="paper-table report-table">
+              <thead>
+                <tr>
+                  <th>Mode</th>
+                  <th>Entry Time (IST)</th>
+                  <th>Exit Time (IST)</th>
+                  <th>Symbol</th>
+                  <th>Direction</th>
+                  <th>Entry Price</th>
+                  <th>Exit Price</th>
+                  <th>Points</th>
+                  <th>Outcome</th>
+                </tr>
+              </thead>
+              <tbody id="report-trades-body">
+                <tr><td colspan="9" class="small">No report loaded yet.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div hidden>
+            <button id="clear-log" type="button">Clear</button>
+            <ul id="timeline"></ul>
+            <pre id="explanation">Waiting...</pre>
+            <div id="feature-list"></div>
+            <p id="paper-gate-last">Last gate: --</p>
+            <div id="paper-gate-list"><p>No diagnostics yet.</p></div>
+          </div>
+        </article>
+      </section>
+
+      <section class="portal-view" data-view="profile" hidden>
+        <article class="card view-card">
+          <h2>My Profile</h2>
+          <p id="user-line" class="small">Checking session...</p>
+          <div class="profile-grid">
+            <div class="profile-row"><span>Name</span><strong id="profile-name">--</strong></div>
+            <div class="profile-row"><span>Email</span><strong id="profile-email">--</strong></div>
+            <div class="profile-row"><span>Mobile</span><strong id="profile-mobile">--</strong></div>
+            <div class="profile-row"><span>Subscription</span><strong id="profile-plan">Starter</strong></div>
+            <div class="profile-row"><span>Lot Size Qty</span><strong id="profile-lot-size-qty">--</strong></div>
+            <div class="profile-row"><span>My Lots</span><strong id="profile-lot-count">1</strong></div>
+            <div class="profile-row"><span>Order Quantity</span><strong id="profile-order-qty">--</strong></div>
+          </div>
+          <label class="field">
+            <span>Set My Lots</span>
+            <input id="user-lot-count-input" class="text-input" type="number" min="1" step="1" value="1">
+          </label>
+          <div class="action-row">
+            <button id="user-lot-count-save-btn" class="action-btn" type="button">Save Lots</button>
+          </div>
+          <p id="user-lot-count-msg" class="small">Lot settings not loaded yet.</p>
+        </article>
+      </section>
+
+      <section class="portal-view" data-view="helpdesk" hidden>
+        <article class="card view-card">
+          <h2>Helpdesk</h2>
+          <p class="small">Need support? Reach our helpdesk team for onboarding, broker setup, and trade report issues.</p>
+          <div class="placeholder-grid">
+            <div class="placeholder-item">
+              <h3>Email</h3>
+              <p>support@sensiblealgo.in</p>
+            </div>
+            <div class="placeholder-item">
+              <h3>Support Hours</h3>
+              <p>Mon-Sat | 9:00 AM - 7:00 PM IST</p>
+            </div>
+            <div class="placeholder-item">
+              <h3>Response SLA</h3>
+              <p>Within 24 business hours</p>
+            </div>
+          </div>
+        </article>
+      </section>
+    </main>
+  </div>
+
+  <div id="subscribe-modal" class="pricing-modal" hidden aria-hidden="true">
+    <div class="pricing-modal-backdrop" data-subscribe-modal-close></div>
+    <div class="pricing-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="pricing-modal-title">
+      <div class="pricing-modal-head">
+        <h2 id="pricing-modal-title">Choose Your Plan</h2>
+        <button id="subscribe-modal-close-btn" class="pricing-close-btn" type="button" aria-label="Close pricing modal">&times;</button>
+      </div>
+      <p class="small">Select a plan to unlock live trading engine.</p>
+      <div class="pricing-card-grid">
+        <article class="pricing-plan-card" data-plan-card="monthly">
+          <p class="pricing-plan-name">Monthly</p>
+          <p class="pricing-plan-price">INR 3,000</p>
+          <p class="small">Billed every month.</p>
+          <button class="action-btn plan-subscribe-btn" type="button" data-subscribe-plan="monthly">Subscribe Now</button>
+        </article>
+        <article class="pricing-plan-card" data-plan-card="quarterly">
+          <p class="pricing-plan-name">Quarterly</p>
+          <p class="pricing-plan-price">INR 7,500</p>
+          <p class="small">Billed every 3 months.</p>
+          <button class="action-btn plan-subscribe-btn" type="button" data-subscribe-plan="quarterly">Subscribe Now</button>
+        </article>
+        <article class="pricing-plan-card" data-plan-card="yearly">
+          <p class="pricing-plan-name">Yearly</p>
+          <p class="pricing-plan-price">INR 24,000</p>
+          <p class="small">Billed once per year.</p>
+          <button class="action-btn plan-subscribe-btn" type="button" data-subscribe-plan="yearly">Subscribe Now</button>
+        </article>
+      </div>
+      <p id="subscribe-msg" class="small pricing-msg">Activate your paid plan to continue live trading access.</p>
+    </div>
+  </div>
+
+  <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+  <script src="/ui/static/app.js"></script>
+</body>
+</html>

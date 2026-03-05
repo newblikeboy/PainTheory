@@ -1,0 +1,10 @@
+fastapi==0.135.1
+fyers-apiv3==3.1.10
+scikit-learn==1.7.2
+joblib==1.5.2
+xgboost==3.2.0
+python-dotenv==1.2.2
+uvicorn[standard]==0.41.0
+pydantic==2.12.5
+tzdata==2025.2
+mysql-connector-python==9.6.0
