@@ -1727,6 +1727,34 @@ class MySQLLiveOrderStore:
         finally:
             conn.close()
 
+    def get_open_trades(self, *, limit: int = 5000) -> List[Dict[str, Any]]:
+        if not self.enabled:
+            return []
+        conn = self._try_connect()
+        if conn is None:
+            return []
+        try:
+            cur = conn.cursor(dictionary=True)
+            cur.execute(
+                f"""
+                SELECT id, username, trade_id, symbol, exchange, quantity, direction,
+                       entry_order_id, entry_ts, exit_order_id, exit_ts, status, created_at, updated_at
+                FROM `{self.table}`
+                WHERE status = 'open'
+                ORDER BY entry_ts DESC, id DESC
+                LIMIT %s
+                """,
+                (int(max(1, min(limit, 20000))),),
+            )
+            rows = cur.fetchall()
+            cur.close()
+            return [dict(r) for r in rows] if rows else []
+        except Exception as exc:
+            logger.warning("MySQLLiveOrderStore.get_open_trades error: %s", exc)
+            return []
+        finally:
+            conn.close()
+
 
 class CentralizedAngelExecutionManager:
     ORDER_URL = "https://apiconnect.angelone.in/rest/secure/angelbroking/order/v1/placeOrder"
@@ -1772,6 +1800,95 @@ class CentralizedAngelExecutionManager:
             "ok": False,
             "message": "No live dispatch yet.",
         }
+        self._restore_open_positions_from_store()
+
+    def _restore_open_positions_from_store(self) -> None:
+        if not self.enabled or self.live_order_store is None:
+            return
+        rows = self.live_order_store.get_open_trades(limit=5000)
+        if not rows:
+            return
+
+        latest_trade_id = 0
+        latest_entry_ts = 0
+        trade_ids: set[int] = set()
+        for row in rows:
+            trade_id = _to_int(row.get("trade_id"), 0)
+            entry_ts = _to_int(row.get("entry_ts"), 0)
+            if trade_id > 0:
+                trade_ids.add(trade_id)
+            if entry_ts > latest_entry_ts or (entry_ts == latest_entry_ts and trade_id > latest_trade_id):
+                latest_entry_ts = entry_ts
+                latest_trade_id = trade_id
+
+        if latest_trade_id <= 0:
+            logger.warning("Live execution recovery skipped: open rows exist but no valid trade_id was found.")
+            return
+
+        session_map: Dict[str, Dict[str, Any]] = {}
+        try:
+            for session in self.user_auth.list_connected_angel_sessions(5000):
+                username = str(session.get("username") or "").strip().lower()
+                if username:
+                    session_map[username] = session
+        except Exception as exc:
+            logger.warning("Live execution recovery could not load Angel sessions: %s", exc)
+
+        lot_size_qty = self._resolve_global_lot_size_qty()
+        restored: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            trade_id = _to_int(row.get("trade_id"), 0)
+            if trade_id != latest_trade_id:
+                continue
+            username = str(row.get("username") or "").strip().lower()
+            if not username:
+                continue
+            session = session_map.get(username, {})
+            restored[username] = {
+                "username": username,
+                "client_id": str(session.get("client_id") or "").strip(),
+                "access_token": str(session.get("access_token") or "").strip(),
+                "symbol": str(row.get("symbol") or "").strip(),
+                "symbol_token": "",
+                "exchange": str(row.get("exchange") or self.exchange).strip().upper() or self.exchange,
+                "user_lot_count": self._resolve_user_lot_count(session),
+                "lot_size_qty": int(lot_size_qty),
+                "quantity": max(1, _to_int(row.get("quantity"), self.quantity)),
+                "entry_order_id": str(row.get("entry_order_id") or "").strip(),
+                "entry_ts": _to_int(row.get("entry_ts"), 0),
+                "restored_from_store": True,
+                "store_row_id": _to_int(row.get("id"), 0),
+            }
+
+        if not restored:
+            logger.warning(
+                "Live execution recovery found %s open row(s) but could not reconstruct any active positions.",
+                len(rows),
+            )
+            return
+
+        self._active_trade_id = latest_trade_id
+        self._active_positions = restored
+        self._last_event = {
+            "type": "recovery",
+            "ts": int(time.time()),
+            "ok": True,
+            "trade_id": int(latest_trade_id),
+            "restored_users": len(restored),
+            "open_row_count": len(rows),
+            "message": "Recovered unresolved live positions from MySQL store.",
+        }
+        if len(trade_ids) > 1:
+            logger.warning(
+                "Live execution recovery found multiple open trade_ids %s; restored only the latest trade_id=%s.",
+                sorted(trade_ids),
+                latest_trade_id,
+            )
+        logger.warning(
+            "Live execution recovered %s unresolved live position(s) for trade_id=%s from MySQL store.",
+            len(restored),
+            latest_trade_id,
+        )
 
     def _resolve_global_lot_size_qty(self) -> int:
         try:
@@ -1984,7 +2101,17 @@ class CentralizedAngelExecutionManager:
             except Exception:
                 pass
             return
-        loop.create_task(coro)
+        task = loop.create_task(coro)
+
+        def _log_task_result(done: asyncio.Task) -> None:
+            try:
+                done.result()
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.exception("Live execution async task failed: %s", exc)
+
+        task.add_done_callback(_log_task_result)
 
     def _build_headers(self, access_token: str) -> Dict[str, str]:
         return {
@@ -2465,6 +2592,10 @@ class CentralizedAngelExecutionManager:
                     "trade_id": int(trade_id),
                     "message": "No tracked open positions to close.",
                 }
+                logger.warning(
+                    "Live exit skipped for trade_id=%s because no in-memory open positions were tracked.",
+                    int(trade_id),
+                )
                 return
 
             sessions = await asyncio.to_thread(self.user_auth.list_connected_angel_sessions, 5000)
@@ -2508,6 +2639,14 @@ class CentralizedAngelExecutionManager:
                         symbol_token = normalized["symbol_token"]
                         exchange = normalized["exchange"] or exchange
                 if not access_token or not symbol or not symbol_token:
+                    logger.warning(
+                        "Live exit could not proceed for trade_id=%s user=%s symbol=%s access_token=%s symbol_token=%s",
+                        int(trade_id),
+                        username,
+                        symbol,
+                        bool(access_token),
+                        bool(symbol_token),
+                    )
                     failed_count += 1
                     saved = dict(position)
                     saved["symbol"] = symbol
@@ -2536,6 +2675,13 @@ class CentralizedAngelExecutionManager:
                         except Exception as _exc:
                             logger.warning("live_order_store.save_exit failed for %s: %s", username, _exc)
                 else:
+                    logger.warning(
+                        "Live exit order failed for trade_id=%s user=%s symbol=%s message=%s",
+                        int(trade_id),
+                        username,
+                        symbol,
+                        str(result.get("message") or "unknown_error"),
+                    )
                     failed_count += 1
                     remaining[username] = dict(position)
 
@@ -2551,6 +2697,14 @@ class CentralizedAngelExecutionManager:
                 "remaining_open_positions": len(remaining),
                 "close_reason": str(closed_trade.get("close_reason") or ""),
             }
+            if failed_count > 0:
+                logger.warning(
+                    "Live exit completed with failures for trade_id=%s closed_users=%s failed_users=%s remaining=%s",
+                    int(trade_id),
+                    int(closed_count),
+                    int(failed_count),
+                    len(remaining),
+                )
 
     def get_status(self) -> Dict[str, Any]:
         lot_size_qty = self._resolve_global_lot_size_qty()
