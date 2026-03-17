@@ -3005,6 +3005,27 @@ def _is_nse_market_hours(timestamp: int) -> bool:
     return _NSE_OPEN_TIME <= current <= _NSE_CLOSE_TIME
 
 
+def _seconds_until_next_nse_market_open(now_ts: Optional[int] = None) -> int:
+    moment = (
+        datetime.fromtimestamp(int(now_ts), tz=_IST)
+        if now_ts is not None
+        else datetime.now(_IST)
+    )
+    if moment.weekday() < 5 and _NSE_OPEN_TIME <= moment.time() <= _NSE_CLOSE_TIME:
+        return 0
+    for day_offset in range(0, 8):
+        day = (moment + timedelta(days=day_offset)).date()
+        open_dt = datetime.combine(day, _NSE_OPEN_TIME, tzinfo=_IST)
+        if open_dt.weekday() >= 5:
+            continue
+        if day_offset == 0:
+            if moment < open_dt:
+                return max(1, int((open_dt - moment).total_seconds()))
+            continue
+        return max(1, int((open_dt - moment).total_seconds()))
+    return 3600
+
+
 _FYERS_AUTH_ERROR_CODES = {-300, -99, -15, 401, 403}
 
 
@@ -3519,6 +3540,16 @@ async def process_tick(state: AppState, tick: Dict[str, float]) -> None:
 async def stream_loop(state: AppState) -> None:
     while True:
         try:
+            if state.settings.market_hours_only:
+                wait_sec = _seconds_until_next_nse_market_open()
+                if wait_sec > 0:
+                    resume_at = datetime.now(_IST) + timedelta(seconds=wait_sec)
+                    logger.info(
+                        "FYERS stream paused outside NSE market hours; retrying at %s IST.",
+                        resume_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    )
+                    await asyncio.sleep(wait_sec)
+                    continue
             token_generation = int(state.fyers_token_generation)
             token = str(state.settings.fyers_access_token or "").strip()
             if not token:
@@ -3536,7 +3567,10 @@ async def stream_loop(state: AppState) -> None:
             )
             await stream.run(
                 lambda tick: process_tick(state, tick),
-                should_stop=lambda: int(state.fyers_token_generation) != token_generation,
+                should_stop=lambda: (
+                    int(state.fyers_token_generation) != token_generation
+                    or (state.settings.market_hours_only and not _is_nse_market_hours(int(time.time())))
+                ),
             )
             if int(state.fyers_token_generation) != token_generation:
                 logger.info("Restarting FYERS stream with refreshed token.")
@@ -3554,6 +3588,16 @@ async def option_chain_loop(state: AppState) -> None:
         try:
             if not state.settings.options_enabled:
                 return
+            if state.settings.market_hours_only:
+                wait_sec = _seconds_until_next_nse_market_open()
+                if wait_sec > 0:
+                    resume_at = datetime.now(_IST) + timedelta(seconds=wait_sec)
+                    logger.info(
+                        "FYERS option poller paused outside NSE market hours; retrying at %s IST.",
+                        resume_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    )
+                    await asyncio.sleep(wait_sec)
+                    continue
             if not state.settings.fyers_client_id or not state.settings.fyers_access_token:
                 await asyncio.sleep(5)
                 continue
@@ -3598,7 +3642,10 @@ async def option_chain_loop(state: AppState) -> None:
 
             await poller.run(
                 on_option,
-                should_stop=lambda: int(state.fyers_token_generation) != token_generation,
+                should_stop=lambda: (
+                    int(state.fyers_token_generation) != token_generation
+                    or (state.settings.market_hours_only and not _is_nse_market_hours(int(time.time())))
+                ),
             )
             if int(state.fyers_token_generation) != token_generation:
                 logger.info("Restarting FYERS option poller with refreshed token.")
