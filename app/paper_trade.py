@@ -12,6 +12,7 @@ import uuid
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import mysql_connect_kwargs_from_parts
+from .option_contracts import contract_days_to_expiry, contract_tradeability, extract_option_contract
 
 
 def _to_int(value: Any, default: int = 0) -> int:
@@ -354,12 +355,75 @@ class PaperTradeEngine:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
+            self._ensure_mysql_varchar_column(
+                conn,
+                table=self._mysql_trades_table,
+                column="close_reason",
+                length=128,
+                nullable=True,
+            )
+            self._ensure_mysql_varchar_column(
+                conn,
+                table=self._mysql_mistakes_table,
+                column="close_reason",
+                length=128,
+                nullable=False,
+                default="",
+            )
             conn.commit()
         finally:
             if cur is not None:
                 cur.close()
             if conn is not None:
                 conn.close()
+
+    def _ensure_mysql_varchar_column(
+        self,
+        conn: Any,
+        *,
+        table: str,
+        column: str,
+        length: int,
+        nullable: bool,
+        default: Optional[str] = None,
+    ) -> None:
+        cur = conn.cursor(dictionary=True)
+        try:
+            cur.execute(
+                """
+                SELECT DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s
+                LIMIT 1
+                """,
+                (self._mysql_database, table, column),
+            )
+            row = cur.fetchone() or {}
+        finally:
+            cur.close()
+
+        if not row:
+            return
+
+        data_type = str(row.get("DATA_TYPE") or "").strip().lower()
+        current_length = _to_int(row.get("CHARACTER_MAXIMUM_LENGTH"), 0)
+        current_nullable = str(row.get("IS_NULLABLE") or "").strip().upper() == "YES"
+        if data_type == "varchar" and current_length >= int(length) and current_nullable == bool(nullable):
+            return
+
+        nullable_sql = "NULL" if nullable else "NOT NULL"
+        default_sql = ""
+        if default is not None:
+            escaped = str(default).replace("\\", "\\\\").replace("'", "\\'")
+            default_sql = f" DEFAULT '{escaped}'"
+
+        alter = conn.cursor()
+        try:
+            alter.execute(
+                f"ALTER TABLE `{table}` MODIFY COLUMN `{column}` VARCHAR({int(max(1, length))}) {nullable_sql}{default_sql}"
+            )
+        finally:
+            alter.close()
 
     def _load(self) -> None:
         if self._storage_backend == "mysql":
@@ -1382,11 +1446,34 @@ class PaperTradeEngine:
         snapshot = option_snapshot if isinstance(option_snapshot, dict) else {}
         raw_atm = _to_float(snapshot.get("atm_strike"), 0.0)
         strikes = snapshot.get("strikes")
+        snapshot_ts = _to_int(snapshot.get("timestamp"), 0)
+        contract_rows: List[Dict[str, Any]] = []
         strike_values: List[float] = []
         if isinstance(strikes, list):
             for row in strikes:
                 if not isinstance(row, dict):
                     continue
+                contract = extract_option_contract(
+                    row,
+                    snapshot_ts=snapshot_ts,
+                    explicit_option_type=str(row.get("option_type") or ""),
+                    explicit_strike=_to_float(row.get("strike"), 0.0),
+                )
+                tradeable, tradeable_reason = contract_tradeability(
+                    contract,
+                    reference_ts=snapshot_ts,
+                    allow_expiry_day=True,
+                )
+                enriched = dict(row)
+                enriched["_contract"] = contract
+                enriched["_tradeable"] = bool(tradeable)
+                enriched["_tradeable_reason"] = str(tradeable_reason or "")
+                contract_rows.append(enriched)
+                strike = _to_float(row.get("strike"), 0.0)
+                if strike > 0.0 and tradeable:
+                    strike_values.append(strike)
+        if not strike_values and contract_rows:
+            for row in contract_rows:
                 strike = _to_float(row.get("strike"), 0.0)
                 if strike > 0.0:
                     strike_values.append(strike)
@@ -1424,30 +1511,65 @@ class PaperTradeEngine:
         selected_symbol = ""
         selected_symbol_token = ""
         selected_exchange = ""
+        selected_underlying = ""
+        selected_expiry_date = ""
+        selected_expiry_ts = 0
+        selected_expiry_kind = ""
+        selected_contract_key = ""
+        selected_tradeable = False
+        selected_reject_reason = ""
         if side == "CE":
             if abs(selected_strike - atm_strike) <= 1e-9:
                 ltp_value = _to_float(snapshot.get("atm_ce_ltp"), 0.0)
         else:
             if abs(selected_strike - atm_strike) <= 1e-9:
                 ltp_value = _to_float(snapshot.get("atm_pe_ltp"), 0.0)
-        if isinstance(strikes, list):
-            for row in strikes:
-                if not isinstance(row, dict):
-                    continue
-                option_type = str(row.get("option_type", "")).upper()
-                strike = _to_float(row.get("strike"), 0.0)
-                if option_type == side and abs(strike - selected_strike) <= 1e-9:
-                    ltp_value = _to_float(row.get("ltp"), ltp_value)
-                    selected_symbol = str(row.get("symbol") or "").strip()
-                    selected_symbol_token = str(
-                        row.get("symbol_token")
-                        or row.get("symboltoken")
-                        or row.get("token")
-                        or row.get("fy_token")
-                        or ""
-                    ).strip()
-                    selected_exchange = str(row.get("exchange") or "").strip().upper()
-                    break
+        candidate_pool = [
+            row
+            for row in contract_rows
+            if str(row.get("option_type", "")).upper() == side
+            and abs(_to_float(row.get("strike"), 0.0) - selected_strike) <= 1e-9
+            and bool(row.get("_tradeable"))
+        ]
+        if not candidate_pool:
+            candidate_pool = [
+                row
+                for row in contract_rows
+                if str(row.get("option_type", "")).upper() == side
+                and abs(_to_float(row.get("strike"), 0.0) - selected_strike) <= 1e-9
+            ]
+        if candidate_pool:
+            best_row = min(
+                candidate_pool,
+                key=lambda row: (
+                    0 if bool(row.get("_tradeable")) else 1,
+                    contract_days_to_expiry(
+                        row.get("_contract") if isinstance(row.get("_contract"), dict) else {},
+                        reference_ts=snapshot_ts,
+                    ),
+                    0 if str((row.get("_contract") or {}).get("symbol_token") or "").strip() else 1,
+                    0 if str((row.get("_contract") or {}).get("symbol") or "").strip() else 1,
+                ),
+            )
+            contract = best_row.get("_contract") if isinstance(best_row.get("_contract"), dict) else {}
+            ltp_value = _to_float(best_row.get("ltp"), ltp_value)
+            selected_symbol = str(contract.get("symbol") or best_row.get("symbol") or "").strip()
+            selected_symbol_token = str(
+                contract.get("symbol_token")
+                or best_row.get("symbol_token")
+                or best_row.get("symboltoken")
+                or best_row.get("token")
+                or best_row.get("fy_token")
+                or ""
+            ).strip()
+            selected_exchange = str(contract.get("exchange") or best_row.get("exchange") or "").strip().upper()
+            selected_underlying = str(contract.get("underlying") or "").strip().upper()
+            selected_expiry_date = str(contract.get("expiry_date") or "").strip()
+            selected_expiry_ts = _to_int(contract.get("expiry_ts"), 0)
+            selected_expiry_kind = str(contract.get("expiry_kind") or "").strip().lower()
+            selected_contract_key = str(contract.get("contract_key") or "").strip()
+            selected_tradeable = bool(best_row.get("_tradeable"))
+            selected_reject_reason = str(best_row.get("_tradeable_reason") or "")
 
         return {
             "side": side,
@@ -1458,6 +1580,13 @@ class PaperTradeEngine:
             "symbol": selected_symbol,
             "symbol_token": selected_symbol_token,
             "exchange": selected_exchange,
+            "underlying": selected_underlying,
+            "expiry_date": selected_expiry_date,
+            "expiry_ts": int(selected_expiry_ts),
+            "expiry_kind": selected_expiry_kind,
+            "contract_key": selected_contract_key,
+            "tradeable": bool(selected_tradeable),
+            "reject_reason": selected_reject_reason,
             "ltp_ref": float(ltp_value),
             "snapshot_ts": _to_int(snapshot.get("timestamp"), 0),
             "source": "option_snapshot" if snapshot else "spot_fallback",
@@ -1501,7 +1630,7 @@ class PaperTradeEngine:
         origin_low: float,
         origin_high: float,
         ai_state: Optional[Dict[str, Any]] = None,
-    ) -> None:
+    ) -> bool:
         levels = self._entry_levels(
             direction=direction,
             entry_price=close_price,
@@ -1518,6 +1647,15 @@ class PaperTradeEngine:
             or ""
         ).strip()
         option_exchange = str(selected.get("exchange") or "").strip().upper()
+        contract_tradeable, contract_reason = contract_tradeability(
+            selected,
+            reference_ts=ts,
+            allow_expiry_day=True,
+        )
+        if not option_symbol or not contract_tradeable:
+            reason = str(contract_reason or "missing_option_symbol")
+            self._note_gate("option_contract_blocked", ts, reason)
+            return False
         trade_id = len(self._trades) + (1 if self._active_trade else 0) + 1
         self._active_trade = {
             "trade_id": trade_id,
@@ -1536,12 +1674,18 @@ class PaperTradeEngine:
             "option_exchange": option_exchange,
             "option_side": str(selected.get("side") or "").upper(),
             "option_strike": _to_float(selected.get("strike"), 0.0),
+            "option_underlying": str(selected.get("underlying") or "").strip().upper(),
+            "option_expiry_date": str(selected.get("expiry_date") or "").strip(),
+            "option_expiry_ts": _to_int(selected.get("expiry_ts"), 0),
+            "option_expiry_kind": str(selected.get("expiry_kind") or "").strip().lower(),
+            "option_contract_key": str(selected.get("contract_key") or "").strip(),
             # Entry is locked to the first live option quote mark.
             "option_entry_ltp": 0.0,
             "option_mark_ltp": 0.0,
             "option_quote_ts": 0,
             "signal": dict(signal),
         }
+        return True
 
     def _manage_open_trade(self, candle: Dict[str, Any], ai_state: Dict[str, Any]) -> bool:
         if self._active_trade is None:
@@ -1857,7 +2001,7 @@ class PaperTradeEngine:
                     guidance=guidance,
                     compression_bars=prev_compression_count,
                 )
-                self._enter_trade(
+                opened = self._enter_trade(
                     ts=ts,
                     close_price=close_price,
                     direction=direction,
@@ -1866,8 +2010,9 @@ class PaperTradeEngine:
                     origin_high=_to_float(candle.get("high"), close_price),
                     ai_state=ai_state,
                 )
-                self._note_gate("entry_opened", ts, "release_gate_disabled")
-                state_changed = True
+                if opened:
+                    self._note_gate("entry_opened", ts, "release_gate_disabled")
+                    state_changed = True
                 if state_changed:
                     self._persist()
                 return self._state_locked()
@@ -1896,7 +2041,7 @@ class PaperTradeEngine:
                 )
                 self._compression_count = 0
                 if not self.require_pain_release or self.entry_style == "aggressive":
-                    self._enter_trade(
+                    opened = self._enter_trade(
                         ts=ts,
                         close_price=close_price,
                         direction=direction,
@@ -1905,9 +2050,10 @@ class PaperTradeEngine:
                         origin_high=_to_float(release_signal.get("release_high"), close_price),
                         ai_state=ai_state,
                     )
-                    self._note_gate("entry_opened", ts, "release_entry")
-                    self._pending_release = None
-                    state_changed = True
+                    if opened:
+                        self._note_gate("entry_opened", ts, "release_entry")
+                        self._pending_release = None
+                        state_changed = True
                 else:
                     self._pending_release = release_signal
             elif self.require_pain_release:
@@ -1927,7 +2073,7 @@ class PaperTradeEngine:
                     features=features,
                     direction=direction,
                 ):
-                    self._enter_trade(
+                    opened = self._enter_trade(
                         ts=ts,
                         close_price=close_price,
                         direction=direction,
@@ -1936,9 +2082,10 @@ class PaperTradeEngine:
                         origin_high=_to_float(pending.get("release_high"), close_price),
                         ai_state=ai_state,
                     )
-                    self._note_gate("entry_opened", ts, "conservative_confirmed")
-                    self._pending_release = None
-                    state_changed = True
+                    if opened:
+                        self._note_gate("entry_opened", ts, "conservative_confirmed")
+                        self._pending_release = None
+                        state_changed = True
                 else:
                     self._note_gate("pending_release_wait", ts, "awaiting_conservative_confirmation")
 
@@ -2012,6 +2159,36 @@ class PaperTradeEngine:
     def get_state(self) -> Dict[str, Any]:
         with self._lock:
             return self._state_locked()
+
+    def has_active_trade(self) -> bool:
+        with self._lock:
+            return self._active_trade is not None
+
+    def force_close_active_trade(
+        self,
+        *,
+        reason: str,
+        exit_ts: int = 0,
+        exit_price: float = 0.0,
+    ) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            if self._active_trade is None:
+                return None
+            resolved_exit_ts = _to_int(exit_ts, int(time.time()))
+            resolved_exit_price = _to_float(exit_price, 0.0)
+            if resolved_exit_price > 0.0:
+                self._last_price = resolved_exit_price
+            else:
+                resolved_exit_price = _to_float(self._last_price, 0.0)
+            if resolved_exit_price <= 0.0:
+                resolved_exit_price = _to_float(self._active_trade.get("entry_price"), 0.0)
+            closed = self._close_active_trade(
+                exit_ts=resolved_exit_ts,
+                exit_price=resolved_exit_price,
+                reason=str(reason),
+            )
+            self._persist()
+            return dict(closed) if isinstance(closed, dict) else None
 
     def get_gate_diagnostics(self) -> Dict[str, Any]:
         with self._lock:

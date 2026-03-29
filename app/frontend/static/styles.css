@@ -676,6 +676,26 @@ body {
   overflow: auto;
 }
 
+#angel-api-zone .paper-table th,
+#angel-api-zone .paper-table td {
+  white-space: normal;
+  vertical-align: top;
+}
+
+.angel-api-table th:nth-child(9),
+.angel-api-table td:nth-child(9),
+.angel-api-table th:nth-child(10),
+.angel-api-table td:nth-child(10) {
+  min-width: 20rem;
+}
+
+.angel-hit-log {
+  margin: 0;
+  min-width: 18rem;
+  max-width: 32rem;
+  max-height: 14rem;
+}
+
 .backtest-progress {
   margin-top: 0.55rem;
 }
@@ -970,4 +990,3 @@ body {
     width: 100%;
   }
 }
-

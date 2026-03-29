@@ -52,6 +52,7 @@
         <button type="button" class="side-nav-btn" data-view-target="chart" data-nav-close>Live Chart</button>
         <button type="button" class="side-nav-btn" data-view-target="paper" data-nav-close>Paper Trades</button>
         <button type="button" class="side-nav-btn" data-view-target="lotconfig" data-nav-close>Lot Settings</button>
+        <button type="button" class="side-nav-btn" data-view-target="angelhits" data-nav-close>Angel API Hits</button>
         <button type="button" class="side-nav-btn" data-view-target="backtest" data-nav-close>Backtest</button>
         <button type="button" class="side-nav-btn" data-view-target="retrain" data-nav-close>Retrain Status</button>
         <button type="button" class="side-nav-btn" data-view-target="fyers" data-nav-close>FYERS Auth</button>
@@ -219,6 +220,83 @@
             </div>
             <p id="admin-lot-size-current" class="small mono">Current lot size: --</p>
             <p id="admin-lot-size-msg" class="small">Not loaded yet.</p>
+          </article>
+        </section>
+      </section>
+
+      <section class="portal-view" data-view="angelhits" hidden>
+        <section id="angel-api-zone" class="grid backtest-grid">
+          <article class="card">
+            <div class="line-head">
+              <p class="label">Angel One Place Order Hits</p>
+              <div class="action-row">
+                <button id="angel-api-load-btn" class="action-btn" type="button">Load Day</button>
+              </div>
+            </div>
+            <p class="small">Shows every Angel One `placeOrder` API hit with request payload, broker response, and user mapping.</p>
+            <div class="backtest-form">
+              <label class="field">
+                <span>Date (IST)</span>
+                <input id="angel-api-date" class="text-input" type="date">
+              </label>
+            </div>
+            <div class="paper-kpis backtest-kpis">
+              <div class="paper-kpi">
+                <span class="kpi-label">Total Hits</span>
+                <span class="kpi-value" id="angel-api-total">0</span>
+              </div>
+              <div class="paper-kpi">
+                <span class="kpi-label">Success</span>
+                <span class="kpi-value" id="angel-api-success">0</span>
+              </div>
+              <div class="paper-kpi">
+                <span class="kpi-label">Failed</span>
+                <span class="kpi-value" id="angel-api-failed">0</span>
+              </div>
+              <div class="paper-kpi">
+                <span class="kpi-label">Users</span>
+                <span class="kpi-value" id="angel-api-users">0</span>
+              </div>
+              <div class="paper-kpi">
+                <span class="kpi-label">Rows Loaded</span>
+                <span class="kpi-value" id="angel-api-count">0</span>
+              </div>
+            </div>
+            <p id="angel-api-status" class="small">Select a day and load the audit log.</p>
+            <div>
+              <p class="small">User breakdown</p>
+              <div id="angel-api-user-list" class="feature-list">
+                <p class="small">No user stats loaded.</p>
+              </div>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="line-head">
+              <p class="label">Daily API Hit Log</p>
+              <p class="small mono" id="angel-api-day-label">--</p>
+            </div>
+            <div class="paper-table-wrap">
+              <table class="paper-table angel-api-table">
+                <thead>
+                  <tr>
+                    <th>Time (IST)</th>
+                    <th>User</th>
+                    <th>Phase</th>
+                    <th>Side</th>
+                    <th>Symbol</th>
+                    <th>Qty</th>
+                    <th>Status</th>
+                    <th>Order ID</th>
+                    <th>Payload</th>
+                    <th>Response</th>
+                  </tr>
+                </thead>
+                <tbody id="angel-api-body">
+                  <tr><td colspan="10" class="small">No Angel One API hits loaded.</td></tr>
+                </tbody>
+              </table>
+            </div>
           </article>
         </section>
       </section>

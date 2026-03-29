@@ -1,4 +1,5 @@
 import asyncio
+import calendar
 import base64
 import hashlib
 import hmac
@@ -26,6 +27,13 @@ from .backtest import BacktestEngine, MySQLBacktestResultStore
 from .config import Settings, load_settings, mysql_connect_kwargs, mysql_connect_kwargs_from_parts
 from .db_retention import MySQLRetentionService
 from .ml.auto_retrain import AutoRetrainService
+from .option_contracts import (
+    build_contract_key,
+    build_symbol_search_candidates,
+    contract_tradeability,
+    extract_option_contract,
+    normalize_option_symbol,
+)
 from .paper_trade import PaperTradeEngine
 from .pain_theory_ai import PainTheoryRuntime
 from .stream.fyers_stream import FyersTickStream
@@ -39,6 +47,11 @@ except ZoneInfoNotFoundError:
     _IST = timezone(timedelta(hours=5, minutes=30))
 _NSE_OPEN_TIME = dt_time(9, 15)
 _NSE_CLOSE_TIME = dt_time(15, 30)
+_SOS_DATA_STALE_SEC = 60
+_SOS_WATCHDOG_POLL_SEC = 5
+_SOS_RETRY_COOLDOWN_SEC = 15
+_SOS_UNDERLYING_CLOSE_REASON = "SOS Close - Unablt to Fet Underlying Value of Order Strike"
+_SOS_OPTION_QUOTE_CLOSE_REASON = "SOS Close - Unable to Fetch Option Quote of Order Strike"
 _RAZORPAY_PLAN_CATALOG: Dict[str, Dict[str, Any]] = {
     "monthly": {
         "name": "Sensible Algo Monthly",
@@ -70,6 +83,14 @@ class IngestCandle(BaseModel):
 class IngestOptionStrike(BaseModel):
     option_type: str
     strike: float
+    symbol: str = ""
+    symbol_token: str = ""
+    exchange: str = ""
+    underlying: str = ""
+    expiry_date: str = ""
+    expiry_ts: int = 0
+    expiry_kind: str = ""
+    contract_key: str = ""
     ltp: float = 0.0
     volume: float = 0.0
     oi_change: float = 0.0
@@ -670,11 +691,11 @@ class MySQLOptionSnapshotStore:
         elif isinstance(row, dict):
             ddl = str(row.get("Create Table") or row.get("create table") or "")
         text = ddl.lower()
-        compact = text.replace(" ", "")
+        compact = text.replace(" ", "").replace("`", "").replace('"', "")
         required = (
-            "`snapshot_id`varchar(48)notnull",
-            "primarykey(`snapshot_id`)",
-            f"key`idx_{self.table}_ts`(`timestamp`)",
+            "snapshot_idvarchar(48)notnull",
+            "primarykey(snapshot_id)",
+            f"keyidx_{self.table}_ts(timestamp)",
         )
         return all(item in compact for item in required)
 
@@ -1029,10 +1050,17 @@ class MySQLOptionStrikeStore:
                 f"""
                 CREATE TABLE IF NOT EXISTS `{self.table}` (
                     snapshot_id VARCHAR(48) NOT NULL,
+                    contract_key VARCHAR(160) NOT NULL DEFAULT '',
                     timestamp BIGINT NOT NULL,
                     option_type VARCHAR(2) NOT NULL,
                     strike DOUBLE NOT NULL,
                     symbol VARCHAR(96) NOT NULL DEFAULT '',
+                    symbol_token VARCHAR(64) NOT NULL DEFAULT '',
+                    exchange VARCHAR(16) NOT NULL DEFAULT '',
+                    underlying VARCHAR(32) NOT NULL DEFAULT '',
+                    expiry_date VARCHAR(16) NOT NULL DEFAULT '',
+                    expiry_ts BIGINT NULL,
+                    expiry_kind VARCHAR(16) NOT NULL DEFAULT '',
                     ltp DOUBLE NOT NULL,
                     volume DOUBLE NOT NULL,
                     oi_change DOUBLE NOT NULL,
@@ -1040,9 +1068,10 @@ class MySQLOptionStrikeStore:
                     spot_price DOUBLE NULL,
                     created_at BIGINT NOT NULL,
                     updated_at BIGINT NOT NULL,
-                    PRIMARY KEY (snapshot_id, option_type, strike),
+                    PRIMARY KEY (snapshot_id, contract_key),
                     INDEX idx_{self.table}_ts (timestamp),
                     INDEX idx_{self.table}_strike_ts (strike, timestamp),
+                    INDEX idx_{self.table}_expiry_ts (expiry_ts),
                     INDEX idx_{self.table}_updated (updated_at)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
@@ -1055,10 +1084,23 @@ class MySQLOptionStrikeStore:
                 "snapshot_id",
                 "VARCHAR(48) NOT NULL DEFAULT '' FIRST",
             )
+            self._ensure_column(
+                conn,
+                "contract_key",
+                "VARCHAR(160) NOT NULL DEFAULT '' AFTER `snapshot_id`",
+            )
+            self._ensure_column(conn, "symbol_token", "VARCHAR(64) NOT NULL DEFAULT '' AFTER `symbol`")
+            self._ensure_column(conn, "exchange", "VARCHAR(16) NOT NULL DEFAULT '' AFTER `symbol_token`")
+            self._ensure_column(conn, "underlying", "VARCHAR(32) NOT NULL DEFAULT '' AFTER `exchange`")
+            self._ensure_column(conn, "expiry_date", "VARCHAR(16) NOT NULL DEFAULT '' AFTER `underlying`")
+            self._ensure_column(conn, "expiry_ts", "BIGINT NULL AFTER `expiry_date`")
+            self._ensure_column(conn, "expiry_kind", "VARCHAR(16) NOT NULL DEFAULT '' AFTER `expiry_ts`")
             self._ensure_index(conn, f"idx_{self.table}_snapshot_id", "`snapshot_id`")
             self._ensure_index(conn, f"idx_{self.table}_ts", "`timestamp`")
+            self._ensure_index(conn, f"idx_{self.table}_expiry_ts", "`expiry_ts`")
             self._backfill_snapshot_ids(conn)
-            self._ensure_primary_key(conn, ["snapshot_id", "option_type", "strike"])
+            self._backfill_contract_keys(conn)
+            self._ensure_primary_key(conn, ["snapshot_id", "contract_key"])
             conn.commit()
         finally:
             if cur is not None:
@@ -1081,11 +1123,12 @@ class MySQLOptionStrikeStore:
         elif isinstance(row, dict):
             ddl = str(row.get("Create Table") or row.get("create table") or "")
         text = ddl.lower()
-        compact = text.replace(" ", "")
+        compact = text.replace(" ", "").replace("`", "").replace('"', "")
         required = (
-            "`snapshot_id`varchar(48)notnull",
-            "primarykey(`snapshot_id`,`option_type`,`strike`)",
-            f"key`idx_{self.table}_ts`(`timestamp`)",
+            "snapshot_idvarchar(48)notnull",
+            "contract_keyvarchar(160)notnull",
+            "primarykey(snapshot_id,contract_key)",
+            f"keyidx_{self.table}_ts(timestamp)",
         )
         return all(item in compact for item in required)
 
@@ -1163,6 +1206,37 @@ class MySQLOptionStrikeStore:
         finally:
             cur.close()
 
+    def _backfill_contract_keys(self, conn: Any) -> None:
+        probe = conn.cursor()
+        try:
+            probe.execute(
+                f"""
+                SELECT 1
+                FROM `{self.table}`
+                WHERE (contract_key IS NULL OR contract_key = '')
+                LIMIT 1
+                """
+            )
+            needed = probe.fetchone() is not None
+        finally:
+            probe.close()
+        if not needed:
+            return
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                f"""
+                UPDATE `{self.table}`
+                SET contract_key = COALESCE(
+                    NULLIF(TRIM(symbol), ''),
+                    CONCAT(option_type, '|', CAST(strike AS CHAR), '|', CAST(timestamp AS CHAR))
+                )
+                WHERE (contract_key IS NULL OR contract_key = '')
+                """
+            )
+        finally:
+            cur.close()
+
     def _ensure_primary_key(self, conn: Any, columns: List[str]) -> None:
         expected = [str(col).strip().lower() for col in columns]
         cur = conn.cursor(dictionary=True)
@@ -1227,17 +1301,37 @@ class MySQLOptionStrikeStore:
                     strike = _to_float(strike_row.get("strike"), 0.0)
                     if strike <= 0.0:
                         continue
-                    symbol = str(strike_row.get("symbol") or "").strip()[:96]
+                    contract = extract_option_contract(
+                        strike_row,
+                        snapshot_ts=ts,
+                        explicit_option_type=option_type,
+                        explicit_strike=strike,
+                    )
+                    symbol = str(contract.get("symbol") or strike_row.get("symbol") or "").strip()[:96]
+                    contract_key = str(contract.get("contract_key") or build_contract_key(contract) or symbol or f"{option_type}|{strike}|{ts}")[:160]
+                    symbol_token = str(contract.get("symbol_token") or "").strip()[:64]
+                    exchange = str(contract.get("exchange") or "").strip().upper()[:16]
+                    underlying = str(contract.get("underlying") or "").strip().upper()[:32]
+                    expiry_date = str(contract.get("expiry_date") or "").strip()[:16]
+                    expiry_ts = _to_int(contract.get("expiry_ts"), 0) or None
+                    expiry_kind = str(contract.get("expiry_kind") or "").strip().lower()[:16]
                     ltp = _to_float(strike_row.get("ltp"), 0.0)
                     volume = max(0.0, _to_float(strike_row.get("volume"), 0.0))
                     oi_change = _to_float(strike_row.get("oi_change"), 0.0)
                     payload_rows.append(
                         (
                             snapshot_id,
+                            contract_key,
                             ts,
                             option_type,
                             strike,
                             symbol,
+                            symbol_token,
+                            exchange,
+                            underlying,
+                            expiry_date,
+                            expiry_ts,
+                            expiry_kind,
                             ltp,
                             volume,
                             oi_change,
@@ -1254,10 +1348,17 @@ class MySQLOptionStrikeStore:
                 f"""
                 INSERT INTO `{self.table}` (
                     snapshot_id,
+                    contract_key,
                     timestamp,
                     option_type,
                     strike,
                     symbol,
+                    symbol_token,
+                    exchange,
+                    underlying,
+                    expiry_date,
+                    expiry_ts,
+                    expiry_kind,
                     ltp,
                     volume,
                     oi_change,
@@ -1265,10 +1366,17 @@ class MySQLOptionStrikeStore:
                     spot_price,
                     created_at,
                     updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
                     snapshot_id = VALUES(snapshot_id),
+                    contract_key = VALUES(contract_key),
                     symbol = VALUES(symbol),
+                    symbol_token = VALUES(symbol_token),
+                    exchange = VALUES(exchange),
+                    underlying = VALUES(underlying),
+                    expiry_date = VALUES(expiry_date),
+                    expiry_ts = VALUES(expiry_ts),
+                    expiry_kind = VALUES(expiry_kind),
                     ltp = VALUES(ltp),
                     volume = VALUES(volume),
                     oi_change = VALUES(oi_change),
@@ -1308,10 +1416,17 @@ class MySQLOptionStrikeStore:
                 f"""
                 SELECT
                     snapshot_id,
+                    contract_key,
                     timestamp,
                     option_type,
                     strike,
                     symbol,
+                    symbol_token,
+                    exchange,
+                    underlying,
+                    expiry_date,
+                    expiry_ts,
+                    expiry_kind,
                     ltp,
                     volume,
                     oi_change,
@@ -1319,7 +1434,7 @@ class MySQLOptionStrikeStore:
                     spot_price
                 FROM `{self.table}`
                 WHERE snapshot_id = %s
-                ORDER BY strike ASC, option_type ASC
+                ORDER BY COALESCE(expiry_ts, 0) ASC, strike ASC, option_type ASC, contract_key ASC
                 LIMIT %s
                 """,
                 (sid, max_rows),
@@ -1328,10 +1443,17 @@ class MySQLOptionStrikeStore:
             return [
                 {
                     "snapshot_id": str(row.get("snapshot_id") or "").strip(),
+                    "contract_key": str(row.get("contract_key") or "").strip(),
                     "timestamp": _normalize_epoch_seconds(row.get("timestamp")),
                     "option_type": str(row.get("option_type") or "").upper().strip(),
                     "strike": _to_float(row.get("strike"), 0.0),
                     "symbol": str(row.get("symbol") or "").strip(),
+                    "symbol_token": str(row.get("symbol_token") or "").strip(),
+                    "exchange": str(row.get("exchange") or "").strip().upper(),
+                    "underlying": str(row.get("underlying") or "").strip().upper(),
+                    "expiry_date": str(row.get("expiry_date") or "").strip(),
+                    "expiry_ts": _normalize_epoch_seconds(row.get("expiry_ts")),
+                    "expiry_kind": str(row.get("expiry_kind") or "").strip().lower(),
                     "ltp": _to_float(row.get("ltp"), 0.0),
                     "volume": _to_float(row.get("volume"), 0.0),
                     "oi_change": _to_float(row.get("oi_change"), 0.0),
@@ -1353,6 +1475,7 @@ class MySQLOptionStrikeStore:
 class AppState:
     def __init__(self) -> None:
         self.settings: Settings = load_settings()
+        self.startup_ts: int = int(time.time())
         self.pain_runtime = PainTheoryRuntime(
             model_path=self.settings.pain_ai_model_path,
             use_model=self.settings.pain_ai_use_model,
@@ -1386,8 +1509,15 @@ class AppState:
         self.current_1m: Optional[Dict[str, float]] = None
         self.current_5m: Optional[Dict[str, float]] = None
         self.last_tick: Optional[Dict[str, float]] = None
+        self.last_underlying_data_received_at: int = 0
+        self.last_underlying_source_ts: int = 0
         self.last_option_signature: Optional[tuple[Any, ...]] = None
         self.last_option_ts: int = 0
+        self.last_option_quote_received_at: int = 0
+        self.last_option_quote_source_ts: int = 0
+        self.last_option_quote_trade_id: int = 0
+        self.last_sos_underlying_trigger_at: int = 0
+        self.last_sos_option_trigger_at: int = 0
         self.candle_store = MySQLCandleStore(
             enabled=self.settings.runtime_persist_live_candles,
             host=self.settings.auth_mysql_host,
@@ -1508,10 +1638,25 @@ class AppState:
             ssl_verify_cert=self.settings.auth_mysql_ssl_verify_cert,
             ssl_verify_identity=self.settings.auth_mysql_ssl_verify_identity,
         )
+        self.angel_order_audit_store = MySQLAngelOrderAuditStore(
+            enabled=True,
+            host=self.settings.auth_mysql_host,
+            port=self.settings.auth_mysql_port,
+            user=self.settings.auth_mysql_user,
+            password=self.settings.auth_mysql_password,
+            database=self.settings.auth_mysql_database,
+            connect_timeout_sec=self.settings.auth_mysql_connect_timeout_sec,
+            ssl_mode=self.settings.auth_mysql_ssl_mode,
+            ssl_ca=self.settings.auth_mysql_ssl_ca,
+            ssl_disabled=self.settings.auth_mysql_ssl_disabled,
+            ssl_verify_cert=self.settings.auth_mysql_ssl_verify_cert,
+            ssl_verify_identity=self.settings.auth_mysql_ssl_verify_identity,
+        )
         self.live_execution = CentralizedAngelExecutionManager(
             settings=self.settings,
             user_auth=self.user_auth,
             live_order_store=self.live_order_store,
+            audit_store=self.angel_order_audit_store,
         )
 
 
@@ -1610,12 +1755,46 @@ class MySQLLiveOrderStore:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
+            self._ensure_close_reason_column(conn)
             conn.commit()
         finally:
             if cur is not None:
                 cur.close()
             if conn is not None:
                 conn.close()
+
+    def _ensure_close_reason_column(self, conn: Any) -> None:
+        cur = conn.cursor(dictionary=True)
+        try:
+            cur.execute(
+                """
+                SELECT DATA_TYPE, CHARACTER_MAXIMUM_LENGTH
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = 'close_reason'
+                LIMIT 1
+                """,
+                (self.database, self.table),
+            )
+            row = cur.fetchone() or {}
+        finally:
+            cur.close()
+
+        alter = conn.cursor()
+        try:
+            if not row:
+                alter.execute(
+                    f"ALTER TABLE `{self.table}` ADD COLUMN close_reason VARCHAR(128) NOT NULL DEFAULT '' AFTER status"
+                )
+                return
+            data_type = str(row.get("DATA_TYPE") or "").strip().lower()
+            length = _to_int(row.get("CHARACTER_MAXIMUM_LENGTH"), 0)
+            if data_type == "varchar" and length >= 128:
+                return
+            alter.execute(
+                f"ALTER TABLE `{self.table}` MODIFY COLUMN close_reason VARCHAR(128) NOT NULL DEFAULT ''"
+            )
+        finally:
+            alter.close()
 
     def _try_connect(self) -> Optional[Any]:
         if not self.enabled:
@@ -1639,8 +1818,8 @@ class MySQLLiveOrderStore:
                 f"""
                 INSERT INTO `{self.table}`
                     (username, trade_id, symbol, exchange, quantity, direction,
-                     entry_order_id, entry_ts, exit_order_id, exit_ts, status, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, '', 0, 'open', %s, %s)
+                     entry_order_id, entry_ts, exit_order_id, exit_ts, status, close_reason, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, '', 0, 'open', '', %s, %s)
                 """,
                 (
                     str(username).strip().lower(),
@@ -1662,7 +1841,7 @@ class MySQLLiveOrderStore:
         finally:
             conn.close()
 
-    def save_exit(self, *, username: str, trade_id: int, exit_order_id: str, exit_ts: int) -> None:
+    def save_exit(self, *, username: str, trade_id: int, exit_order_id: str, exit_ts: int, close_reason: str = "") -> None:
         if not self.enabled:
             return
         conn = self._try_connect()
@@ -1674,7 +1853,7 @@ class MySQLLiveOrderStore:
             cur.execute(
                 f"""
                 UPDATE `{self.table}`
-                SET exit_order_id = %s, exit_ts = %s, status = 'closed', updated_at = %s
+                SET exit_order_id = %s, exit_ts = %s, status = 'closed', close_reason = %s, updated_at = %s
                 WHERE username = %s AND trade_id = %s AND status = 'open'
                 ORDER BY id DESC
                 LIMIT 1
@@ -1682,6 +1861,7 @@ class MySQLLiveOrderStore:
                 (
                     str(exit_order_id),
                     int(exit_ts),
+                    str(close_reason or "")[:128],
                     now,
                     str(username).strip().lower(),
                     int(trade_id),
@@ -1705,7 +1885,7 @@ class MySQLLiveOrderStore:
             cur.execute(
                 f"""
                 SELECT id, username, trade_id, symbol, exchange, quantity, direction,
-                       entry_order_id, entry_ts, exit_order_id, exit_ts, status, created_at, updated_at
+                       entry_order_id, entry_ts, exit_order_id, exit_ts, status, close_reason, created_at, updated_at
                 FROM `{self.table}`
                 WHERE username = %s AND entry_ts >= %s AND entry_ts <= %s
                 ORDER BY entry_ts DESC
@@ -1738,7 +1918,7 @@ class MySQLLiveOrderStore:
             cur.execute(
                 f"""
                 SELECT id, username, trade_id, symbol, exchange, quantity, direction,
-                       entry_order_id, entry_ts, exit_order_id, exit_ts, status, created_at, updated_at
+                       entry_order_id, entry_ts, exit_order_id, exit_ts, status, close_reason, created_at, updated_at
                 FROM `{self.table}`
                 WHERE status = 'open'
                 ORDER BY entry_ts DESC, id DESC
@@ -1753,6 +1933,299 @@ class MySQLLiveOrderStore:
             logger.warning("MySQLLiveOrderStore.get_open_trades error: %s", exc)
             return []
         finally:
+            conn.close()
+
+
+class MySQLAngelOrderAuditStore:
+    """Persists every Angel One place-order API hit with payload and response details."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = True,
+        host: str,
+        port: int,
+        user: str,
+        password: str,
+        database: str,
+        connect_timeout_sec: int = 10,
+        ssl_mode: str = "",
+        ssl_ca: str = "",
+        ssl_disabled: bool = False,
+        ssl_verify_cert: bool = False,
+        ssl_verify_identity: bool = False,
+        table: str = "angel_order_api_hits",
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.host = host
+        self.port = int(port)
+        self.user = user
+        self.password = password
+        self.database = database
+        self.connect_timeout_sec = int(connect_timeout_sec)
+        self.ssl_mode = ssl_mode
+        self.ssl_ca = ssl_ca
+        self.ssl_disabled = ssl_disabled
+        self.ssl_verify_cert = ssl_verify_cert
+        self.ssl_verify_identity = ssl_verify_identity
+        self.table = table
+        self._mysql: Any = None
+        if self.enabled:
+            try:
+                import mysql.connector  # type: ignore
+                self._mysql = mysql.connector
+            except ImportError:
+                logger.warning("MySQLAngelOrderAuditStore disabled: mysql-connector-python not installed")
+                self.enabled = False
+            if self.enabled:
+                try:
+                    self._initialize_schema()
+                except Exception as exc:
+                    logger.warning("MySQLAngelOrderAuditStore schema init failed: %s", exc)
+
+    def _connect(self) -> Any:
+        kwargs = mysql_connect_kwargs_from_parts(
+            host=self.host,
+            port=self.port,
+            user=self.user,
+            password=self.password,
+            database=self.database,
+            connect_timeout_sec=self.connect_timeout_sec,
+            with_database=True,
+            autocommit=False,
+            ssl_mode=self.ssl_mode,
+            ssl_ca=self.ssl_ca,
+            ssl_disabled=self.ssl_disabled,
+            ssl_verify_cert=self.ssl_verify_cert,
+            ssl_verify_identity=self.ssl_verify_identity,
+        )
+        return self._mysql.connect(**kwargs)
+
+    def _initialize_schema(self) -> None:
+        conn = None
+        cur = None
+        try:
+            conn = self._connect()
+            cur = conn.cursor()
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS `{self.table}` (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    request_ts BIGINT NOT NULL DEFAULT 0,
+                    username VARCHAR(190) NOT NULL DEFAULT '',
+                    client_id VARCHAR(64) NOT NULL DEFAULT '',
+                    trade_id BIGINT NOT NULL DEFAULT 0,
+                    phase VARCHAR(16) NOT NULL DEFAULT '',
+                    transaction_type VARCHAR(8) NOT NULL DEFAULT '',
+                    symbol VARCHAR(96) NOT NULL DEFAULT '',
+                    symbol_token VARCHAR(64) NOT NULL DEFAULT '',
+                    exchange VARCHAR(16) NOT NULL DEFAULT '',
+                    quantity INT NOT NULL DEFAULT 0,
+                    request_payload_json LONGTEXT NOT NULL,
+                    response_json LONGTEXT NOT NULL,
+                    ok TINYINT(1) NOT NULL DEFAULT 0,
+                    http_status INT NOT NULL DEFAULT 0,
+                    error_message VARCHAR(255) NOT NULL DEFAULT '',
+                    order_id VARCHAR(80) NOT NULL DEFAULT '',
+                    created_at BIGINT NOT NULL,
+                    INDEX idx_aoah_request_ts (request_ts),
+                    INDEX idx_aoah_username (username),
+                    INDEX idx_aoah_trade_id (trade_id),
+                    INDEX idx_aoah_ok (ok),
+                    INDEX idx_aoah_phase (phase)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            conn.commit()
+        finally:
+            if cur is not None:
+                cur.close()
+            if conn is not None:
+                conn.close()
+
+    def _try_connect(self) -> Optional[Any]:
+        if not self.enabled:
+            return None
+        try:
+            return self._connect()
+        except Exception as exc:
+            logger.warning("MySQLAngelOrderAuditStore connect failed: %s", exc)
+            return None
+
+    @staticmethod
+    def _json_text(payload: Any) -> str:
+        try:
+            return json.dumps(payload if payload is not None else {}, ensure_ascii=True, separators=(",", ":"), default=str)
+        except Exception:
+            return "{}"
+
+    def save_hit(
+        self,
+        *,
+        request_ts: int,
+        username: str,
+        client_id: str,
+        trade_id: int,
+        phase: str,
+        transaction_type: str,
+        symbol: str,
+        symbol_token: str,
+        exchange: str,
+        quantity: int,
+        request_payload: Any,
+        response_payload: Any,
+        ok: bool,
+        http_status: int,
+        error_message: str,
+        order_id: str,
+    ) -> None:
+        if not self.enabled:
+            return
+        conn = self._try_connect()
+        if conn is None:
+            return
+        now = int(time.time())
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                f"""
+                INSERT INTO `{self.table}`
+                    (request_ts, username, client_id, trade_id, phase, transaction_type,
+                     symbol, symbol_token, exchange, quantity, request_payload_json,
+                     response_json, ok, http_status, error_message, order_id, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    int(request_ts),
+                    str(username or "").strip().lower(),
+                    str(client_id or "").strip(),
+                    int(trade_id),
+                    str(phase or "").strip().lower()[:16],
+                    str(transaction_type or "").strip().upper()[:8],
+                    str(symbol or "").strip(),
+                    str(symbol_token or "").strip(),
+                    str(exchange or "").strip().upper(),
+                    max(0, int(quantity or 0)),
+                    self._json_text(request_payload),
+                    self._json_text(response_payload),
+                    1 if bool(ok) else 0,
+                    max(0, int(http_status or 0)),
+                    str(error_message or "").strip()[:255],
+                    str(order_id or "").strip()[:80],
+                    now,
+                ),
+            )
+            conn.commit()
+            cur.close()
+        except Exception as exc:
+            logger.warning("MySQLAngelOrderAuditStore.save_hit error: %s", exc)
+        finally:
+            conn.close()
+
+    def get_hits_in_range(self, *, start_ts: int, end_ts: int, limit: int = 500) -> List[Dict[str, Any]]:
+        if not self.enabled:
+            return []
+        conn = self._try_connect()
+        if conn is None:
+            return []
+        try:
+            cur = conn.cursor(dictionary=True)
+            cur.execute(
+                f"""
+                SELECT id, request_ts, username, client_id, trade_id, phase, transaction_type,
+                       symbol, symbol_token, exchange, quantity, request_payload_json,
+                       response_json, ok, http_status, error_message, order_id, created_at
+                FROM `{self.table}`
+                WHERE request_ts >= %s AND request_ts <= %s
+                ORDER BY request_ts DESC, id DESC
+                LIMIT %s
+                """,
+                (int(start_ts), int(end_ts), int(max(1, min(limit, 5000)))),
+            )
+            rows = cur.fetchall()
+            cur.close()
+            return [dict(row) for row in rows] if rows else []
+        except Exception as exc:
+            logger.warning("MySQLAngelOrderAuditStore.get_hits_in_range error: %s", exc)
+            return []
+        finally:
+            conn.close()
+
+    def get_summary_in_range(self, *, start_ts: int, end_ts: int) -> Dict[str, Any]:
+        summary = {
+            "total_hits": 0,
+            "success_hits": 0,
+            "failed_hits": 0,
+            "unique_users": 0,
+            "users": [],
+        }
+        if not self.enabled:
+            return summary
+        conn = self._try_connect()
+        if conn is None:
+            return summary
+        cur = None
+        user_cur = None
+        try:
+            cur = conn.cursor(dictionary=True)
+            cur.execute(
+                f"""
+                SELECT
+                    COUNT(*) AS total_hits,
+                    COALESCE(SUM(CASE WHEN ok = 1 THEN 1 ELSE 0 END), 0) AS success_hits,
+                    COALESCE(SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END), 0) AS failed_hits,
+                    COUNT(DISTINCT CASE WHEN username <> '' THEN username END) AS unique_users
+                FROM `{self.table}`
+                WHERE request_ts >= %s AND request_ts <= %s
+                """,
+                (int(start_ts), int(end_ts)),
+            )
+            row = cur.fetchone() or {}
+            summary.update(
+                {
+                    "total_hits": _to_int(row.get("total_hits"), 0),
+                    "success_hits": _to_int(row.get("success_hits"), 0),
+                    "failed_hits": _to_int(row.get("failed_hits"), 0),
+                    "unique_users": _to_int(row.get("unique_users"), 0),
+                }
+            )
+            user_cur = conn.cursor(dictionary=True)
+            user_cur.execute(
+                f"""
+                SELECT
+                    username,
+                    COUNT(*) AS total_hits,
+                    COALESCE(SUM(CASE WHEN ok = 1 THEN 1 ELSE 0 END), 0) AS success_hits,
+                    COALESCE(SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END), 0) AS failed_hits
+                FROM `{self.table}`
+                WHERE request_ts >= %s AND request_ts <= %s
+                  AND username <> ''
+                GROUP BY username
+                ORDER BY total_hits DESC, username ASC
+                LIMIT 200
+                """,
+                (int(start_ts), int(end_ts)),
+            )
+            users = []
+            for item in user_cur.fetchall() or []:
+                users.append(
+                    {
+                        "username": str(item.get("username") or "").strip().lower(),
+                        "total_hits": _to_int(item.get("total_hits"), 0),
+                        "success_hits": _to_int(item.get("success_hits"), 0),
+                        "failed_hits": _to_int(item.get("failed_hits"), 0),
+                    }
+                )
+            summary["users"] = users
+            return summary
+        except Exception as exc:
+            logger.warning("MySQLAngelOrderAuditStore.get_summary_in_range error: %s", exc)
+            return summary
+        finally:
+            if user_cur is not None:
+                user_cur.close()
+            if cur is not None:
+                cur.close()
             conn.close()
 
 
@@ -1778,10 +2251,18 @@ class CentralizedAngelExecutionManager:
     }
     _MONTH_NAME_SET = {"JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"}
 
-    def __init__(self, *, settings: Settings, user_auth: MySQLUserAuthStore, live_order_store: Optional["MySQLLiveOrderStore"] = None) -> None:
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        user_auth: MySQLUserAuthStore,
+        live_order_store: Optional["MySQLLiveOrderStore"] = None,
+        audit_store: Optional["MySQLAngelOrderAuditStore"] = None,
+    ) -> None:
         self.settings = settings
         self.user_auth = user_auth
         self.live_order_store = live_order_store
+        self.audit_store = audit_store
         self.enabled = bool(settings.central_live_execution_enabled)
         self.quantity = max(1, int(settings.central_live_execution_quantity))
         self.exchange = str(settings.central_live_execution_exchange or "NFO").strip().upper() or "NFO"
@@ -1845,6 +2326,7 @@ class CentralizedAngelExecutionManager:
                 continue
             session = session_map.get(username, {})
             restored[username] = {
+                "trade_id": int(trade_id),
                 "username": username,
                 "client_id": str(session.get("client_id") or "").strip(),
                 "access_token": str(session.get("access_token") or "").strip(),
@@ -1917,19 +2399,7 @@ class CentralizedAngelExecutionManager:
 
     @staticmethod
     def _normalize_option_trading_symbol(value: Any) -> str:
-        text = str(value or "").strip().upper()
-        if not text:
-            return ""
-        if ":" in text:
-            text = text.split(":", 1)[1].strip()
-        text = text.replace(" ", "")
-        text = text.replace("-", "")
-        text = text.replace("_", "")
-        text = text.replace("INDEX", "")
-        text = text.replace("NIFTY50", "NIFTY")
-        text = text.replace("NIFTY 50", "NIFTY")
-        text = text.replace("BANKNIFTY", "BANKNIFTY")
-        return text
+        return normalize_option_symbol(value)
 
     @staticmethod
     def _symbol_match_key(value: Any) -> str:
@@ -1956,46 +2426,23 @@ class CentralizedAngelExecutionManager:
 
     @classmethod
     def _parse_option_symbol_parts(cls, value: Any) -> Dict[str, str]:
-        text = cls._normalize_option_trading_symbol(value)
+        contract = extract_option_contract(value)
+        text = cls._normalize_option_trading_symbol(contract.get("symbol"))
         if not text:
             return {}
-        m_angel = re.fullmatch(r"([A-Z]+)(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})(\d+)(CE|PE)", text)
-        if m_angel:
-            return {
-                "underlying": m_angel.group(1),
-                "day": m_angel.group(2),
-                "month": m_angel.group(3),
-                "year": m_angel.group(4),
-                "strike": str(int(m_angel.group(5))),
-                "side": m_angel.group(6),
-            }
-        m_weekly_single_month = re.fullmatch(r"([A-Z]+)(\d{2})([1-9OND])(\d{2})(\d+)(CE|PE)", text)
-        if m_weekly_single_month:
-            month_name = cls._MONTH_CODE_MAP.get(m_weekly_single_month.group(3), "")
-            if not month_name:
-                return {}
-            return {
-                "underlying": m_weekly_single_month.group(1),
-                "year": m_weekly_single_month.group(2),
-                "month": month_name,
-                "day": m_weekly_single_month.group(4),
-                "strike": str(int(m_weekly_single_month.group(5))),
-                "side": m_weekly_single_month.group(6),
-            }
-        m_weekly_double_month = re.fullmatch(r"([A-Z]+)(\d{2})(0[1-9]|1[0-2])(\d{2})(\d+)(CE|PE)", text)
-        if m_weekly_double_month:
-            month_name = cls._MONTH_CODE_MAP.get(str(int(m_weekly_double_month.group(3))), "")
-            if not month_name:
-                return {}
-            return {
-                "underlying": m_weekly_double_month.group(1),
-                "year": m_weekly_double_month.group(2),
-                "month": month_name,
-                "day": m_weekly_double_month.group(4),
-                "strike": str(int(m_weekly_double_month.group(5))),
-                "side": m_weekly_double_month.group(6),
-            }
-        return {}
+        strike = _to_float(contract.get("strike"), 0.0)
+        strike_text = str(int(round(strike))) if strike > 0.0 and abs(strike - round(strike)) < 1e-6 else str(strike or "")
+        month_name = str(contract.get("expiry_month_name") or "").strip().upper()
+        return {
+            "underlying": str(contract.get("underlying") or "").strip().upper(),
+            "day": str(contract.get("expiry_day") or "").strip().zfill(2) if _to_int(contract.get("expiry_day"), 0) > 0 else "",
+            "month": month_name,
+            "year": str(contract.get("expiry_year_short") or "").strip().zfill(2) if contract.get("expiry_year_short") else "",
+            "strike": strike_text,
+            "side": str(contract.get("option_type") or "").strip().upper(),
+            "expiry_kind": str(contract.get("expiry_kind") or "").strip().lower(),
+            "expiry_date": str(contract.get("expiry_date") or "").strip(),
+        }
 
     @classmethod
     def _build_angel_symbol_from_parts(cls, parts: Dict[str, str]) -> str:
@@ -2018,17 +2465,9 @@ class CentralizedAngelExecutionManager:
 
     @classmethod
     def _symbol_search_candidates(cls, value: Any) -> List[str]:
-        base = cls._normalize_option_trading_symbol(value)
-        if not base:
-            return []
-        parts = cls._parse_option_symbol_parts(base)
-        angel = cls._build_angel_symbol_from_parts(parts) if parts else ""
-        out: List[str] = []
-        for candidate in (angel, base):
-            normalized = cls._normalize_option_trading_symbol(candidate)
-            if normalized and normalized not in out:
-                out.append(normalized)
-        return out or [base]
+        contract = extract_option_contract(value)
+        out = [cls._normalize_option_trading_symbol(item) for item in build_symbol_search_candidates(contract)]
+        return [item for item in out if item]
 
     @classmethod
     def _repair_option_symbol(
@@ -2180,7 +2619,9 @@ class CentralizedAngelExecutionManager:
                 score += 10
             if row_parts.get("month") == target_parts.get("month"):
                 score += 10
-            if row_parts.get("day") == target_parts.get("day"):
+            if target_parts.get("day") and row_parts.get("day") == target_parts.get("day"):
+                score += 5
+            if row_parts.get("expiry_kind") == target_parts.get("expiry_kind"):
                 score += 5
         return score
 
@@ -2190,15 +2631,21 @@ class CentralizedAngelExecutionManager:
         access_token: str,
         symbol: str,
         exchange: str,
+        contract_meta: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, str]:
         token = str(access_token or "").strip()
         target_symbol = str(symbol or "").strip()
         target_exchange = str(exchange or self.exchange).strip().upper() or self.exchange
         if not token or not target_symbol:
             return {}
-        candidates = self._symbol_search_candidates(target_symbol)
+        target_contract = extract_option_contract(
+            contract_meta or {"symbol": target_symbol},
+            explicit_option_type=str((contract_meta or {}).get("option_type") or ""),
+            explicit_strike=_to_float((contract_meta or {}).get("strike"), 0.0),
+        )
+        candidates = build_symbol_search_candidates(target_contract)
         target_keys = [self._symbol_match_key(item) for item in candidates if item]
-        target_parts = self._parse_option_symbol_parts(target_symbol)
+        target_parts = self._parse_option_symbol_parts(target_contract.get("symbol") or target_symbol)
         best: Dict[str, str] = {}
         best_score = -1
 
@@ -2272,6 +2719,13 @@ class CentralizedAngelExecutionManager:
             for key in must_match:
                 if str(best_parts.get(key) or "") != str(target_parts.get(key) or ""):
                     return {}
+            for key in ("year", "month"):
+                target_value = str(target_parts.get(key) or "")
+                if target_value and str(best_parts.get(key) or "") != target_value:
+                    return {}
+            target_day = str(target_parts.get("day") or "")
+            if target_day and str(best_parts.get("day") or "") != target_day:
+                return {}
         elif best_score < 100:
             return {}
         return best
@@ -2287,6 +2741,7 @@ class CentralizedAngelExecutionManager:
             access_token=access_token,
             symbol=symbol,
             exchange=exchange,
+            contract_meta={"symbol": symbol},
         )
         return str(resolved.get("symbol_token") or "").strip()
 
@@ -2356,6 +2811,10 @@ class CentralizedAngelExecutionManager:
         exchange: str,
         transaction_type: str,
         quantity: int,
+        username: str = "",
+        client_id: str = "",
+        trade_id: int = 0,
+        phase: str = "",
     ) -> Dict[str, Any]:
         payload = self._build_order_payload(
             symbol=symbol,
@@ -2364,6 +2823,33 @@ class CentralizedAngelExecutionManager:
             transaction_type=transaction_type,
             quantity=quantity,
         )
+        request_ts = int(time.time())
+
+        def _audit(result: Dict[str, Any], response_payload: Any) -> None:
+            if self.audit_store is None:
+                return
+            try:
+                self.audit_store.save_hit(
+                    request_ts=request_ts,
+                    username=username,
+                    client_id=client_id,
+                    trade_id=int(trade_id),
+                    phase=phase,
+                    transaction_type=transaction_type,
+                    symbol=symbol,
+                    symbol_token=symbol_token,
+                    exchange=exchange,
+                    quantity=int(quantity),
+                    request_payload=payload,
+                    response_payload=response_payload,
+                    ok=bool(result.get("ok")),
+                    http_status=_to_int(result.get("http_status"), 0),
+                    error_message=str(result.get("message") or "").strip(),
+                    order_id=str(result.get("order_id") or "").strip(),
+                )
+            except Exception as exc:
+                logger.warning("Angel order audit save failed for user=%s trade_id=%s: %s", username, int(trade_id), exc)
+
         try:
             response = await asyncio.to_thread(
                 requests.post,
@@ -2373,7 +2859,9 @@ class CentralizedAngelExecutionManager:
                 timeout=self.timeout_sec,
             )
         except Exception as exc:
-            return {"ok": False, "message": f"request_failed: {exc}"}
+            result = {"ok": False, "message": f"request_failed: {exc}"}
+            _audit(result, {"error": str(exc), "stage": "request"})
+            return result
 
         status_code = int(getattr(response, "status_code", 500))
         try:
@@ -2381,19 +2869,26 @@ class CentralizedAngelExecutionManager:
         except ValueError:
             body = {}
         if status_code >= 400:
-            return {"ok": False, "message": f"http_{status_code}", "http_status": status_code}
+            result = {"ok": False, "message": f"http_{status_code}", "http_status": status_code}
+            _audit(result, body if body else {"status_code": status_code, "raw_text": str(getattr(response, "text", "") or "")[:4000]})
+            return result
         if isinstance(body, dict) and body.get("status") is False:
             message = str(body.get("message") or body.get("errorcode") or "order_rejected").strip()
-            return {"ok": False, "message": message, "http_status": status_code}
+            result = {"ok": False, "message": message, "http_status": status_code}
+            _audit(result, body)
+            return result
         order_id = self._extract_order_id(body)
         if not order_id:
-            return {"ok": False, "message": "missing_order_id", "http_status": status_code}
-        return {
+            result = {"ok": False, "message": "missing_order_id", "http_status": status_code}
+            _audit(result, body)
+            return result
+        result = {
             "ok": True,
             "order_id": order_id,
             "http_status": status_code,
         }
-
+        _audit(result, body)
+        return result
     def observe_transition(self, before_state: Dict[str, Any], after_state: Dict[str, Any]) -> None:
         if not self.enabled:
             return
@@ -2453,6 +2948,22 @@ class CentralizedAngelExecutionManager:
             )
             symbol_token = str(raw_token or "").strip()
             exchange = str(raw_exchange or self.exchange).strip().upper() or self.exchange
+            contract_meta = extract_option_contract(
+                {
+                    "symbol": symbol,
+                    "symbol_token": symbol_token,
+                    "exchange": exchange,
+                    "option_type": active_trade.get("option_side") or selected.get("side"),
+                    "strike": active_trade.get("option_strike") or selected.get("strike"),
+                    "expiry_date": active_trade.get("option_expiry_date") or selected.get("expiry_date"),
+                    "expiry_ts": active_trade.get("option_expiry_ts") or selected.get("expiry_ts"),
+                    "expiry_kind": active_trade.get("option_expiry_kind") or selected.get("expiry_kind"),
+                    "underlying": selected.get("underlying"),
+                },
+                snapshot_ts=_to_int(active_trade.get("entry_ts"), int(time.time())),
+                explicit_option_type=str(active_trade.get("option_side") or selected.get("side") or ""),
+                explicit_strike=_to_float(active_trade.get("option_strike") or selected.get("strike"), 0.0),
+            )
             if not symbol:
                 self._last_event = {
                     "type": "entry",
@@ -2461,6 +2972,22 @@ class CentralizedAngelExecutionManager:
                     "trade_id": trade_id,
                     "message": "Missing option symbol for live dispatch.",
                     "symbol": symbol,
+                }
+                return
+            tradeable, tradeable_reason = contract_tradeability(
+                contract_meta,
+                reference_ts=_to_int(active_trade.get("entry_ts"), int(time.time())),
+                allow_expiry_day=True,
+            )
+            if not tradeable:
+                self._last_event = {
+                    "type": "entry",
+                    "ts": int(time.time()),
+                    "ok": False,
+                    "trade_id": trade_id,
+                    "message": f"Option contract not tradeable for live dispatch: {tradeable_reason}",
+                    "symbol": symbol,
+                    "expiry_date": str(contract_meta.get("expiry_date") or ""),
                 }
                 return
 
@@ -2487,6 +3014,7 @@ class CentralizedAngelExecutionManager:
                         access_token=access_token,
                         symbol=symbol,
                         exchange=exchange,
+                        contract_meta=contract_meta,
                     )
                     if resolved_instrument:
                         break
@@ -2530,6 +3058,10 @@ class CentralizedAngelExecutionManager:
                     exchange=exchange,
                     transaction_type="BUY",
                     quantity=order_quantity,
+                    username=username,
+                    client_id=str(session.get("client_id") or "").strip(),
+                    trade_id=trade_id,
+                    phase="entry",
                 )
                 if not bool(result.get("ok")):
                     failed += 1
@@ -2537,12 +3069,19 @@ class CentralizedAngelExecutionManager:
                 entry_order_id = str(result.get("order_id") or "").strip()
                 entry_ts_now = int(time.time())
                 placed[username] = {
+                    "trade_id": int(trade_id),
                     "username": username,
                     "client_id": str(session.get("client_id") or "").strip(),
                     "access_token": access_token,
                     "symbol": symbol,
                     "symbol_token": symbol_token,
                     "exchange": exchange,
+                    "underlying": str(contract_meta.get("underlying") or ""),
+                    "option_type": str(contract_meta.get("option_type") or ""),
+                    "strike": _to_float(contract_meta.get("strike"), 0.0),
+                    "expiry_date": str(contract_meta.get("expiry_date") or ""),
+                    "expiry_ts": _to_int(contract_meta.get("expiry_ts"), 0),
+                    "expiry_kind": str(contract_meta.get("expiry_kind") or ""),
                     "user_lot_count": self._resolve_user_lot_count(session),
                     "lot_size_qty": int(lot_size_qty),
                     "quantity": int(order_quantity),
@@ -2598,6 +3137,13 @@ class CentralizedAngelExecutionManager:
                 )
                 return
 
+            resolved_trade_id = int(trade_id)
+            if resolved_trade_id <= 0:
+                for position in open_positions.values():
+                    resolved_trade_id = _to_int(position.get("trade_id"), 0)
+                    if resolved_trade_id > 0:
+                        break
+
             sessions = await asyncio.to_thread(self.user_auth.list_connected_angel_sessions, 5000)
             session_map: Dict[str, Dict[str, Any]] = {}
             for row in sessions:
@@ -2627,6 +3173,7 @@ class CentralizedAngelExecutionManager:
                         access_token=access_token,
                         symbol=symbol,
                         exchange=exchange,
+                        contract_meta=position,
                     )
                     if resolved:
                         normalized = self._apply_resolved_instrument(
@@ -2661,6 +3208,10 @@ class CentralizedAngelExecutionManager:
                     exchange=exchange,
                     transaction_type="SELL",
                     quantity=quantity,
+                    username=username,
+                    client_id=str(fresh.get("client_id") or position.get("client_id") or "").strip(),
+                    trade_id=int(resolved_trade_id),
+                    phase="exit",
                 )
                 if bool(result.get("ok")):
                     closed_count += 1
@@ -2668,16 +3219,17 @@ class CentralizedAngelExecutionManager:
                         try:
                             self.live_order_store.save_exit(
                                 username=username,
-                                trade_id=int(trade_id),
+                                trade_id=int(resolved_trade_id),
                                 exit_order_id=str(result.get("order_id") or "").strip(),
                                 exit_ts=int(time.time()),
+                                close_reason=str(closed_trade.get("close_reason") or ""),
                             )
                         except Exception as _exc:
                             logger.warning("live_order_store.save_exit failed for %s: %s", username, _exc)
                 else:
                     logger.warning(
                         "Live exit order failed for trade_id=%s user=%s symbol=%s message=%s",
-                        int(trade_id),
+                        int(resolved_trade_id),
                         username,
                         symbol,
                         str(result.get("message") or "unknown_error"),
@@ -2685,13 +3237,13 @@ class CentralizedAngelExecutionManager:
                     failed_count += 1
                     remaining[username] = dict(position)
 
-            self._active_trade_id = 0
+            self._active_trade_id = int(resolved_trade_id) if remaining else 0
             self._active_positions = remaining
             self._last_event = {
                 "type": "exit",
                 "ts": int(time.time()),
                 "ok": failed_count == 0,
-                "trade_id": int(trade_id),
+                "trade_id": int(resolved_trade_id),
                 "closed_users": int(closed_count),
                 "failed_users": int(failed_count),
                 "remaining_open_positions": len(remaining),
@@ -2700,11 +3252,27 @@ class CentralizedAngelExecutionManager:
             if failed_count > 0:
                 logger.warning(
                     "Live exit completed with failures for trade_id=%s closed_users=%s failed_users=%s remaining=%s",
-                    int(trade_id),
+                    int(resolved_trade_id),
                     int(closed_count),
                     int(failed_count),
                     len(remaining),
                 )
+
+    def has_open_positions(self) -> bool:
+        return bool(self._active_positions)
+
+    def get_open_positions_snapshot(self) -> Dict[str, Dict[str, Any]]:
+        return {username: dict(position) for username, position in self._active_positions.items()}
+
+    async def force_exit_all(self, *, reason: str) -> Dict[str, Any]:
+        trade_id = int(self._active_trade_id)
+        if trade_id <= 0:
+            for position in self._active_positions.values():
+                trade_id = _to_int(position.get("trade_id"), 0)
+                if trade_id > 0:
+                    break
+        await self._dispatch_exit(trade_id, {"close_reason": str(reason)})
+        return dict(self._last_event)
 
     def get_status(self) -> Dict[str, Any]:
         lot_size_qty = self._resolve_global_lot_size_qty()
@@ -3441,30 +4009,24 @@ def _option_snapshot_from_chain_payload(payload: Dict[str, Any]) -> Optional[Dic
         option_type = str(row.get("option_type", "")).upper()
         if strike <= 0.0 or option_type not in {"CE", "PE"}:
             continue
-        symbol_text = str(
-            row.get("symbol")
-            or row.get("symbol_ticker")
-            or row.get("symbol_name")
-            or row.get("ticker")
-            or row.get("option_symbol")
-            or row.get("name")
-            or ""
-        ).strip()
-        symbol_token = str(
-            row.get("symbol_token")
-            or row.get("symboltoken")
-            or row.get("token")
-            or row.get("fy_token")
-            or ""
-        ).strip()
-        exchange_text = str(row.get("exchange") or "").strip().upper()
+        contract = extract_option_contract(
+            row,
+            snapshot_ts=ts,
+            explicit_option_type=option_type,
+            explicit_strike=strike,
+        )
         compact_strikes.append(
             {
                 "option_type": option_type,
                 "strike": float(strike),
-                "symbol": symbol_text,
-                "symbol_token": symbol_token,
-                "exchange": exchange_text,
+                "symbol": str(contract.get("symbol") or ""),
+                "symbol_token": str(contract.get("symbol_token") or ""),
+                "exchange": str(contract.get("exchange") or ""),
+                "underlying": str(contract.get("underlying") or ""),
+                "expiry_date": str(contract.get("expiry_date") or ""),
+                "expiry_ts": _to_int(contract.get("expiry_ts"), 0),
+                "expiry_kind": str(contract.get("expiry_kind") or ""),
+                "contract_key": str(contract.get("contract_key") or ""),
                 "ltp": _to_float(row.get("ltp"), 0.0),
                 "volume": _to_float(row.get("volume"), 0.0),
                 "oi_change": _to_float(row.get("oich"), 0.0),
@@ -3504,6 +4066,8 @@ async def process_tick(state: AppState, tick: Dict[str, float]) -> None:
             max_ts,
         )
         return
+    state.last_underlying_data_received_at = now_ts
+    state.last_underlying_source_ts = ts
     state.last_tick = {
         "timestamp": ts,
         "price": price,
@@ -3742,14 +4306,118 @@ async def paper_quote_loop(state: AppState) -> None:
                 continue
             quote = await asyncio.to_thread(state.quote_client.fetch_ltp, symbol)
             if quote:
+                quote_symbol = str(quote.get("symbol") or symbol).strip()
+                quote_ts = _to_int(quote.get("timestamp"), int(time.time()))
+                if quote_symbol.upper() == symbol.upper():
+                    state.last_option_quote_received_at = int(time.time())
+                    state.last_option_quote_source_ts = quote_ts
+                    state.last_option_quote_trade_id = _to_int(target.get("trade_id"), 0)
                 state.paper_trade.update_option_mark(
-                    symbol=str(quote.get("symbol") or symbol),
+                    symbol=quote_symbol,
                     ltp=_to_float(quote.get("ltp")),
-                    quote_ts=_to_int(quote.get("timestamp"), int(time.time())),
+                    quote_ts=quote_ts,
                 )
         except Exception as exc:
             logger.exception("Paper quote loop error: %s", exc)
         await asyncio.sleep(sleep_sec)
+
+
+async def sos_data_watchdog_loop(state: AppState) -> None:
+    while True:
+        await asyncio.sleep(_SOS_WATCHDOG_POLL_SEC)
+        try:
+            now_ts = int(time.time())
+            if state.settings.market_hours_only and not _is_nse_market_hours(now_ts):
+                continue
+
+            paper_state = state.paper_trade.get_state()
+            paper_active = paper_state.get("active_trade") if isinstance(paper_state.get("active_trade"), dict) else {}
+            live_positions = state.live_execution.get_open_positions_snapshot()
+            has_open_exposure = bool(paper_active) or bool(live_positions)
+            if not has_open_exposure:
+                continue
+
+            paper_entry_ts = _to_int((paper_active or {}).get("entry_ts"), 0)
+            live_entry_ts = max((_to_int(row.get("entry_ts"), 0) for row in live_positions.values()), default=0)
+            underlying_reference = _to_int(state.last_underlying_data_received_at, 0)
+            if underlying_reference <= 0:
+                underlying_reference = max(int(state.startup_ts), paper_entry_ts, live_entry_ts)
+            underlying_age = max(0, now_ts - underlying_reference)
+            if (
+                underlying_age >= _SOS_DATA_STALE_SEC
+                and now_ts - _to_int(state.last_sos_underlying_trigger_at, 0) >= _SOS_RETRY_COOLDOWN_SEC
+            ):
+                state.last_sos_underlying_trigger_at = now_ts
+                mark_price = _to_float((state.last_tick or {}).get("price"), 0.0)
+                if paper_active:
+                    closed_trade = state.paper_trade.force_close_active_trade(
+                        reason=_SOS_UNDERLYING_CLOSE_REASON,
+                        exit_ts=now_ts,
+                        exit_price=mark_price,
+                    )
+                    if isinstance(closed_trade, dict):
+                        logger.warning(
+                            "SOS forced paper close trade_id=%s reason=%s underlying_age_sec=%s",
+                            _to_int(closed_trade.get("trade_id"), 0),
+                            _SOS_UNDERLYING_CLOSE_REASON,
+                            underlying_age,
+                        )
+                if live_positions:
+                    exit_result = await state.live_execution.force_exit_all(reason=_SOS_UNDERLYING_CLOSE_REASON)
+                    logger.warning(
+                        "SOS forced live exit trade_id=%s reason=%s underlying_age_sec=%s ok=%s remaining=%s",
+                        _to_int(exit_result.get("trade_id"), 0),
+                        _SOS_UNDERLYING_CLOSE_REASON,
+                        underlying_age,
+                        bool(exit_result.get("ok")),
+                        _to_int(exit_result.get("remaining_open_positions"), 0),
+                    )
+                continue
+
+            if not paper_active:
+                continue
+
+            trade_id = _to_int(paper_active.get("trade_id"), 0)
+            option_reference = 0
+            if (
+                trade_id > 0
+                and _to_int(state.last_option_quote_trade_id, 0) == trade_id
+                and _to_int(state.last_option_quote_received_at, 0) > 0
+            ):
+                option_reference = _to_int(state.last_option_quote_received_at, 0)
+            if option_reference <= 0:
+                option_reference = max(int(state.startup_ts), paper_entry_ts)
+            option_age = max(0, now_ts - option_reference)
+            if (
+                option_age >= _SOS_DATA_STALE_SEC
+                and now_ts - _to_int(state.last_sos_option_trigger_at, 0) >= _SOS_RETRY_COOLDOWN_SEC
+            ):
+                state.last_sos_option_trigger_at = now_ts
+                mark_price = _to_float((state.last_tick or {}).get("price"), 0.0)
+                closed_trade = state.paper_trade.force_close_active_trade(
+                    reason=_SOS_OPTION_QUOTE_CLOSE_REASON,
+                    exit_ts=now_ts,
+                    exit_price=mark_price,
+                )
+                if isinstance(closed_trade, dict):
+                    logger.warning(
+                        "SOS forced paper close trade_id=%s reason=%s option_age_sec=%s",
+                        _to_int(closed_trade.get("trade_id"), 0),
+                        _SOS_OPTION_QUOTE_CLOSE_REASON,
+                        option_age,
+                    )
+                if live_positions:
+                    exit_result = await state.live_execution.force_exit_all(reason=_SOS_OPTION_QUOTE_CLOSE_REASON)
+                    logger.warning(
+                        "SOS forced live exit trade_id=%s reason=%s option_age_sec=%s ok=%s remaining=%s",
+                        _to_int(exit_result.get("trade_id"), 0),
+                        _SOS_OPTION_QUOTE_CLOSE_REASON,
+                        option_age,
+                        bool(exit_result.get("ok")),
+                        _to_int(exit_result.get("remaining_open_positions"), 0),
+                    )
+        except Exception as exc:
+            logger.exception("SOS watchdog loop error: %s", exc)
 
 
 def _parse_retrain_daily_time(value: str) -> Optional[dt_time]:
@@ -4243,6 +4911,8 @@ async def startup_event() -> None:
         asyncio.create_task(option_chain_loop(state))
         asyncio.create_task(fyers_refresh_loop(state))
         asyncio.create_task(paper_quote_loop(state))
+        if state.paper_trade.enabled or state.live_execution.enabled:
+            asyncio.create_task(sos_data_watchdog_loop(state))
     if state.settings.model_auto_retrain_enabled:
         asyncio.create_task(model_retrain_loop(state))
     if state.settings.db_retention_enabled:
@@ -4875,6 +5545,93 @@ async def admin_execution_lot_size_update(
         "ok": True,
         "lot_size_qty": int(_to_int(saved.get("lot_size_qty"), 1)),
         "updated_at": int(_to_int(saved.get("updated_at"), 0)),
+    }
+
+
+@app.get("/admin/execution/angel-api-hits")
+async def admin_execution_angel_api_hits(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    date: str = "",
+    limit: int = 500,
+) -> Dict[str, Any]:
+    state: AppState = app.state.state
+    _require_admin(state, _authorization_from_request(authorization, request))
+
+    target_date_text = str(date or "").strip()
+    today_ist = datetime.now(_IST).date()
+    if target_date_text:
+        try:
+            target_day = datetime.strptime(target_date_text, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid date format. Use YYYY-MM-DD.") from exc
+    else:
+        target_day = today_ist
+    if target_day > today_ist:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"date cannot be after {today_ist.isoformat()}.")
+
+    start_ts = int(datetime.combine(target_day, dt_time(0, 0, 0), tzinfo=_IST).timestamp())
+    end_ts = int(datetime.combine(target_day, dt_time(23, 59, 59), tzinfo=_IST).timestamp())
+    max_rows = max(1, min(int(limit), 2000))
+
+    rows = await asyncio.to_thread(
+        state.angel_order_audit_store.get_hits_in_range,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        limit=max_rows,
+    )
+    summary = await asyncio.to_thread(
+        state.angel_order_audit_store.get_summary_in_range,
+        start_ts=start_ts,
+        end_ts=end_ts,
+    )
+
+    out_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        request_payload_raw = str(row.get("request_payload_json") or "").strip()
+        response_payload_raw = str(row.get("response_json") or "").strip()
+        try:
+            request_payload = json.loads(request_payload_raw) if request_payload_raw else {}
+        except Exception:
+            request_payload = {"raw": request_payload_raw}
+        try:
+            response_payload = json.loads(response_payload_raw) if response_payload_raw else {}
+        except Exception:
+            response_payload = {"raw": response_payload_raw}
+        request_ts_val = _to_int(row.get("request_ts"), 0)
+        request_dt = datetime.fromtimestamp(request_ts_val, tz=_IST) if request_ts_val > 0 else None
+        out_rows.append(
+            {
+                "id": _to_int(row.get("id"), 0),
+                "request_ts": request_ts_val,
+                "request_time_ist": request_dt.strftime("%Y-%m-%d %H:%M:%S") if request_dt else "--",
+                "username": str(row.get("username") or "").strip().lower(),
+                "client_id": str(row.get("client_id") or "").strip(),
+                "trade_id": _to_int(row.get("trade_id"), 0),
+                "phase": str(row.get("phase") or "").strip().lower(),
+                "transaction_type": str(row.get("transaction_type") or "").strip().upper(),
+                "symbol": str(row.get("symbol") or "").strip(),
+                "symbol_token": str(row.get("symbol_token") or "").strip(),
+                "exchange": str(row.get("exchange") or "").strip().upper(),
+                "quantity": _to_int(row.get("quantity"), 0),
+                "ok": bool(_to_int(row.get("ok"), 0)),
+                "http_status": _to_int(row.get("http_status"), 0),
+                "error_message": str(row.get("error_message") or "").strip(),
+                "order_id": str(row.get("order_id") or "").strip(),
+                "request_payload": request_payload,
+                "response_payload": response_payload,
+            }
+        )
+
+    return {
+        "ok": True,
+        "enabled": bool(state.angel_order_audit_store.enabled),
+        "date": target_day.isoformat(),
+        "today_ist": today_ist.isoformat(),
+        "limit": int(max_rows),
+        "summary": summary,
+        "count": len(out_rows),
+        "rows": out_rows,
     }
 
 
@@ -5543,7 +6300,7 @@ async def user_report_ai_trades(
                 "exit_price": None,
                 "points": None,
                 "outcome": "Open" if str(row.get("status") or "open") == "open" else "Closed",
-                "close_reason": "",
+                "close_reason": str(row.get("close_reason") or ""),
                 "status": str(row.get("status") or "open"),
                 "entry_order_id": str(row.get("entry_order_id") or ""),
                 "exit_order_id": str(row.get("exit_order_id") or ""),

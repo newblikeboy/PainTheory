@@ -103,6 +103,17 @@
   const adminLotSizeSaveBtn = document.getElementById("admin-lot-size-save-btn");
   const adminLotSizeCurrentEl = document.getElementById("admin-lot-size-current");
   const adminLotSizeMsgEl = document.getElementById("admin-lot-size-msg");
+  const angelApiDateEl = document.getElementById("angel-api-date");
+  const angelApiLoadBtn = document.getElementById("angel-api-load-btn");
+  const angelApiStatusEl = document.getElementById("angel-api-status");
+  const angelApiDayLabelEl = document.getElementById("angel-api-day-label");
+  const angelApiTotalEl = document.getElementById("angel-api-total");
+  const angelApiSuccessEl = document.getElementById("angel-api-success");
+  const angelApiFailedEl = document.getElementById("angel-api-failed");
+  const angelApiUsersEl = document.getElementById("angel-api-users");
+  const angelApiCountEl = document.getElementById("angel-api-count");
+  const angelApiUserListEl = document.getElementById("angel-api-user-list");
+  const angelApiBodyEl = document.getElementById("angel-api-body");
   const brokerClientIdValueEl = document.getElementById("broker-client-id-value");
   const brokerClientIdInputEl = document.getElementById("broker-client-id-input");
   const brokerClientIdSaveBtn = document.getElementById("broker-client-id-save-btn");
@@ -160,6 +171,8 @@
   let currentUser = null;
   let reportBusy = false;
   let lotConfigBusy = false;
+  let angelApiBusy = false;
+  let angelApiLoadedDate = "";
   let lotSizeQty = 1;
   let userLotCount = 1;
   const SUBSCRIPTION_PLANS = {
@@ -288,6 +301,21 @@
 
   function hasAdminLotUi() {
     return Boolean(adminLotSizeInputEl || adminLotSizeSaveBtn || adminLotSizeCurrentEl || adminLotSizeMsgEl);
+  }
+
+  function hasAngelApiUi() {
+    return Boolean(
+      angelApiDateEl &&
+      angelApiLoadBtn &&
+      angelApiStatusEl &&
+      angelApiTotalEl &&
+      angelApiSuccessEl &&
+      angelApiFailedEl &&
+      angelApiUsersEl &&
+      angelApiCountEl &&
+      angelApiUserListEl &&
+      angelApiBodyEl
+    );
   }
 
   function getUserQuantityMultiplier() {
@@ -489,6 +517,149 @@
     reportEndDateEl.max = today;
     if (reportModeSelectEl && !reportModeSelectEl.value) {
       reportModeSelectEl.value = "all";
+    }
+  }
+
+  function setAngelApiDefaults() {
+    if (!hasAngelApiUi()) {
+      return;
+    }
+    const today = formatTodayIstDate();
+    if (!angelApiDateEl.value) {
+      angelApiDateEl.value = today;
+    }
+    angelApiDateEl.max = today;
+  }
+
+  function formatJsonForCell(value) {
+    if (value === null || value === undefined) {
+      return "--";
+    }
+    if (typeof value === "string") {
+      return value || "--";
+    }
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch (_err) {
+      return String(value);
+    }
+  }
+
+  function escapeHtml(value) {
+    return String(value || "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#39;");
+  }
+
+  function renderAngelApiUsers(rows) {
+    if (!angelApiUserListEl) {
+      return;
+    }
+    const list = Array.isArray(rows) ? rows : [];
+    if (!list.length) {
+      angelApiUserListEl.innerHTML = '<p class="small">No user stats for selected day.</p>';
+      return;
+    }
+    angelApiUserListEl.innerHTML = list.map(function (row) {
+      const username = String(row.username || "--");
+      const total = safeNum(row.total_hits, 0);
+      const success = safeNum(row.success_hits, 0);
+      const failed = safeNum(row.failed_hits, 0);
+      return `
+        <div class="feature">
+          <div class="feature-name">
+            <strong>${escapeHtml(username)}</strong>
+            <span class="mono">${total} hit(s)</span>
+          </div>
+          <div class="small">Success ${success} | Failed ${failed}</div>
+        </div>
+      `;
+    }).join("");
+  }
+
+  function renderAngelApiRows(rows) {
+    if (!angelApiBodyEl) {
+      return;
+    }
+    const data = Array.isArray(rows) ? rows : [];
+    if (!data.length) {
+      angelApiBodyEl.innerHTML = '<tr><td colspan="10" class="small">No Angel One API hits found for selected day.</td></tr>';
+      return;
+    }
+    angelApiBodyEl.innerHTML = data.map(function (row) {
+      const ok = Boolean(row.ok);
+      const statusText = ok
+        ? `OK${row.http_status ? ` (${row.http_status})` : ""}`
+        : `FAIL${row.http_status ? ` (${row.http_status})` : ""}${row.error_message ? ` - ${row.error_message}` : ""}`;
+      return `
+        <tr>
+          <td>${escapeHtml(row.request_time_ist || "--")}</td>
+          <td>
+            <div>${escapeHtml(row.username || "--")}</div>
+            <div class="small mono">${escapeHtml(row.client_id || "--")}</div>
+          </td>
+          <td>${escapeHtml((row.phase || "--").toUpperCase())}</td>
+          <td>${escapeHtml(row.transaction_type || "--")}</td>
+          <td>
+            <div>${escapeHtml(row.symbol || "--")}</div>
+            <div class="small mono">${escapeHtml(row.exchange || "--")} / ${escapeHtml(row.symbol_token || "--")}</div>
+          </td>
+          <td>${safeNum(row.quantity, 0)}</td>
+          <td class="${ok ? "outcome-win" : "outcome-loss"}">${escapeHtml(statusText)}</td>
+          <td>${escapeHtml(row.order_id || "--")}</td>
+          <td><pre class="tiny-log angel-hit-log">${escapeHtml(formatJsonForCell(row.request_payload))}</pre></td>
+          <td><pre class="tiny-log angel-hit-log">${escapeHtml(formatJsonForCell(row.response_payload))}</pre></td>
+        </tr>
+      `;
+    }).join("");
+  }
+
+  async function loadAngelApiHits() {
+    if (!hasAngelApiUi() || angelApiBusy) {
+      return;
+    }
+    const targetDate = String((angelApiDateEl && angelApiDateEl.value) || "").trim();
+    if (!targetDate) {
+      setText(angelApiStatusEl, "Date is required.");
+      return;
+    }
+    angelApiBusy = true;
+    angelApiLoadBtn.disabled = true;
+    setText(angelApiStatusEl, "Loading Angel One API audit log...");
+    try {
+      const qs = `date=${encodeURIComponent(targetDate)}&limit=1000`;
+      const payload = await requestJson(`/admin/execution/angel-api-hits?${qs}`);
+      const summary = payload && typeof payload.summary === "object" ? payload.summary : {};
+      const rows = Array.isArray(payload && payload.rows) ? payload.rows : [];
+      angelApiLoadedDate = String(payload.date || targetDate);
+      setText(angelApiDayLabelEl, angelApiLoadedDate || "--");
+      setText(angelApiTotalEl, String(safeNum(summary.total_hits, 0)));
+      setText(angelApiSuccessEl, String(safeNum(summary.success_hits, 0)));
+      setText(angelApiFailedEl, String(safeNum(summary.failed_hits, 0)));
+      setText(angelApiUsersEl, String(safeNum(summary.unique_users, 0)));
+      setText(angelApiCountEl, String(safeNum(payload.count, rows.length)));
+      renderAngelApiUsers(summary.users);
+      renderAngelApiRows(rows);
+      setText(
+        angelApiStatusEl,
+        `Loaded ${safeNum(summary.total_hits, 0)} Angel One place-order hit(s) for ${angelApiLoadedDate}.`
+      );
+    } catch (err) {
+      renderAngelApiUsers([]);
+      renderAngelApiRows([]);
+      setText(angelApiTotalEl, "0");
+      setText(angelApiSuccessEl, "0");
+      setText(angelApiFailedEl, "0");
+      setText(angelApiUsersEl, "0");
+      setText(angelApiCountEl, "0");
+      setText(angelApiDayLabelEl, targetDate || "--");
+      setText(angelApiStatusEl, `Angel API log load failed: ${err.message}`);
+    } finally {
+      angelApiBusy = false;
+      angelApiLoadBtn.disabled = false;
     }
   }
 
@@ -2764,6 +2935,9 @@
         refreshBrokerClientId();
       } else if (viewTarget === "lotconfig") {
         refreshAdminLotSize();
+      } else if (viewTarget === "angelhits") {
+        setAngelApiDefaults();
+        loadAngelApiHits();
       } else if (viewTarget === "profile") {
         refreshUserLotConfig();
       } else if (viewTarget === "report") {
@@ -2853,6 +3027,9 @@
       }
     });
   }
+  if (angelApiLoadBtn) {
+    angelApiLoadBtn.addEventListener("click", loadAngelApiHits);
+  }
   if (reportLoadBtn) {
     reportLoadBtn.addEventListener("click", loadReportTrades);
   }
@@ -2902,6 +3079,7 @@
     }
     setBacktestDefaults();
     setReportDefaults();
+    setAngelApiDefaults();
     setBacktestProgress(0, "idle");
     setSidebarOpen(false);
     setActiveView("home");
