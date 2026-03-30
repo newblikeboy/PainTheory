@@ -364,6 +364,8 @@ def extract_option_contract(
         (row.get("exchange") if isinstance(source, dict) else "")
         or ""
     ).strip().upper()
+    if not exchange and ":" in str(symbol_raw or ""):
+        exchange = str(symbol_raw).split(":", 1)[0].strip().upper()
     symbol_token = str(
         (row.get("symbol_token") if isinstance(source, dict) else "")
         or (row.get("symboltoken") if isinstance(source, dict) else "")

@@ -3965,6 +3965,24 @@ def _option_snapshot_from_chain_payload(payload: Dict[str, Any]) -> Optional[Dic
     underlying = next((item for item in chain if not item.get("option_type")), None)
     spot = _to_float((underlying or {}).get("ltp"), _to_float((underlying or {}).get("fp")))
 
+    # Derive the actual expiry date from the chain payload so holiday-shifted
+    # expiries (e.g. monthly expiry moved from Tuesday to Monday) are correct.
+    chain_expiry: Optional[str] = None
+    expiry_data = data.get("expiryData")
+    if isinstance(expiry_data, list) and expiry_data:
+        first = expiry_data[0]
+        if isinstance(first, dict):
+            raw_date = str(first.get("date") or "").strip()   # "30-03-2026"
+            raw_exp = first.get("expiry")                      # unix ts string
+            if raw_date:
+                chain_expiry = raw_date
+            elif raw_exp:
+                try:
+                    from datetime import datetime as _dt
+                    chain_expiry = _dt.fromtimestamp(int(raw_exp), _IST).strftime("%Y-%m-%d")
+                except Exception:
+                    pass
+
     strikes = [item for item in chain if item.get("option_type") in {"CE", "PE"}]
     strike_values = []
     for item in strikes:
@@ -4014,6 +4032,7 @@ def _option_snapshot_from_chain_payload(payload: Dict[str, Any]) -> Optional[Dic
             snapshot_ts=ts,
             explicit_option_type=option_type,
             explicit_strike=strike,
+            explicit_expiry=chain_expiry or None,
         )
         compact_strikes.append(
             {
