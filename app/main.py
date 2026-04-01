@@ -4323,7 +4323,8 @@ async def paper_quote_loop(state: AppState) -> None:
             if not symbol:
                 await asyncio.sleep(sleep_sec)
                 continue
-            quote = await asyncio.to_thread(state.quote_client.fetch_ltp, symbol)
+            fyers_symbol = symbol if symbol.upper().startswith("NSE:") else f"NSE:{symbol}"
+            quote = await asyncio.to_thread(state.quote_client.fetch_ltp, fyers_symbol)
             if quote:
                 quote_symbol = str(quote.get("symbol") or symbol).strip()
                 quote_ts = _to_int(quote.get("timestamp"), int(time.time()))
