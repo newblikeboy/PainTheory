@@ -115,7 +115,13 @@
   const angelApiUserListEl = document.getElementById("angel-api-user-list");
   const angelApiBodyEl = document.getElementById("angel-api-body");
   const brokerClientIdValueEl = document.getElementById("broker-client-id-value");
+  const brokerApiKeyValueEl = document.getElementById("broker-api-key-value");
+  const brokerPinValueEl = document.getElementById("broker-pin-value");
+  const brokerTotpValueEl = document.getElementById("broker-totp-value");
   const brokerClientIdInputEl = document.getElementById("broker-client-id-input");
+  const brokerApiKeyInputEl = document.getElementById("broker-api-key-input");
+  const brokerPinInputEl = document.getElementById("broker-pin-input");
+  const brokerTotpInputEl = document.getElementById("broker-totp-input");
   const brokerClientIdSaveBtn = document.getElementById("broker-client-id-save-btn");
   const brokerClientIdMsgEl = document.getElementById("broker-client-id-msg");
   const terminalLoginToggleEl = document.getElementById("terminal-login-toggle");
@@ -281,7 +287,13 @@
   function hasBrokerUi() {
     return Boolean(
       brokerClientIdValueEl ||
+      brokerApiKeyValueEl ||
+      brokerPinValueEl ||
+      brokerTotpValueEl ||
       brokerClientIdInputEl ||
+      brokerApiKeyInputEl ||
+      brokerPinInputEl ||
+      brokerTotpInputEl ||
       brokerClientIdSaveBtn ||
       brokerClientIdMsgEl ||
       terminalLoginToggleEl
@@ -1496,13 +1508,30 @@
       const payload = await requestJson("/user/broker/angel-one");
       const config = payload && typeof payload.config === "object" ? payload.config : {};
       const clientId = String(config.client_id || "").trim();
+      const apiKeyHint = String(config.api_key_hint || "").trim();
+      const apiKeySaved = Boolean(config.api_key_saved);
+      const pinSaved = Boolean(config.pin_saved);
+      const totpSaved = Boolean(config.totp_secret_saved);
+      const hasLoginCredentials = Boolean(config.has_login_credentials);
       const connected = Boolean(config.connected);
       const engineEnabled = Boolean(config.trading_engine_enabled || config.enabled);
       setSubscriptionStatusFromData(config);
       setLotConfigFromData({ user_lot_count: config.user_lot_count });
       setText(brokerClientIdValueEl, clientId || "Not set");
+      setText(brokerApiKeyValueEl, apiKeySaved ? (apiKeyHint || "Saved") : "Not saved");
+      setText(brokerPinValueEl, pinSaved ? "Saved" : "Not saved");
+      setText(brokerTotpValueEl, totpSaved ? "Saved" : "Not saved");
       if (brokerClientIdInputEl) {
         brokerClientIdInputEl.value = clientId;
+      }
+      if (brokerApiKeyInputEl) {
+        brokerApiKeyInputEl.value = "";
+      }
+      if (brokerPinInputEl) {
+        brokerPinInputEl.value = "";
+      }
+      if (brokerTotpInputEl) {
+        brokerTotpInputEl.value = "";
       }
       setTerminalLoginConnected(connected);
       setTradingEngineEnabled(engineEnabled);
@@ -1511,7 +1540,7 @@
         brokerClientIdMsgEl,
         connected
           ? "Angel One connected."
-          : (clientId ? "Client ID loaded." : "No client ID saved yet."),
+          : (hasLoginCredentials ? "Angel credentials loaded." : (clientId ? "Client ID loaded. Save API key, PIN, and TOTP secret to enable terminal login." : "No Angel credentials saved yet.")),
       );
     } catch (err) {
       setText(brokerClientIdMsgEl, `Load failed: ${err.message}`);
@@ -1766,6 +1795,9 @@
       return;
     }
     const clientId = String(brokerClientIdInputEl.value || "").trim();
+    const apiKey = brokerApiKeyInputEl ? String(brokerApiKeyInputEl.value || "").trim() : "";
+    const pin = brokerPinInputEl ? String(brokerPinInputEl.value || "").trim() : "";
+    const totpSecret = brokerTotpInputEl ? String(brokerTotpInputEl.value || "").trim() : "";
     if (!clientId) {
       setText(brokerClientIdMsgEl, "Client ID is required.");
       return;
@@ -1777,16 +1809,33 @@
     try {
       const payload = await requestJson("/user/broker/angel-one", {
         method: "POST",
-        data: { client_id: clientId },
+        data: {
+          client_id: clientId,
+          api_key: apiKey,
+          pin: pin,
+          totp_secret: totpSecret,
+        },
       });
       const config = payload && typeof payload.config === "object" ? payload.config : {};
       const saved = String(config.client_id || "").trim();
       setText(brokerClientIdValueEl, saved || "Not set");
+      setText(brokerApiKeyValueEl, config.api_key_saved ? String(config.api_key_hint || "Saved") : "Not saved");
+      setText(brokerPinValueEl, config.pin_saved ? "Saved" : "Not saved");
+      setText(brokerTotpValueEl, config.totp_secret_saved ? "Saved" : "Not saved");
       if (brokerClientIdInputEl) {
         brokerClientIdInputEl.value = saved;
       }
+      if (brokerApiKeyInputEl) {
+        brokerApiKeyInputEl.value = "";
+      }
+      if (brokerPinInputEl) {
+        brokerPinInputEl.value = "";
+      }
+      if (brokerTotpInputEl) {
+        brokerTotpInputEl.value = "";
+      }
       setTerminalLoginConnected(Boolean(config.connected));
-      setText(brokerClientIdMsgEl, "Client ID saved.");
+      setText(brokerClientIdMsgEl, "Angel credentials saved.");
     } catch (err) {
       setText(brokerClientIdMsgEl, `Save failed: ${err.message}`);
     } finally {
@@ -1808,7 +1857,6 @@
     }
     terminalToggleBusy = true;
     terminalLoginToggleEl.disabled = true;
-    let navigating = false;
     try {
       if (terminalConnected) {
         setText(brokerClientIdMsgEl, "Disconnecting Angel One terminal...");
@@ -1826,21 +1874,19 @@
         setText(brokerClientIdMsgEl, "Set and save client ID first.");
         return;
       }
-      setText(brokerClientIdMsgEl, "Opening Angel One login...");
-      const payload = await requestJson("/user/broker/angel-one/login-url");
-      const authUrl = String(payload.auth_url || "").trim();
-      if (!authUrl) {
-        throw new Error("Login URL missing");
-      }
-      navigating = true;
-      window.location.href = authUrl;
+      setText(brokerClientIdMsgEl, "Logging in to Angel terminal...");
+      const payload = await requestJson("/user/broker/angel-one/login", {
+        method: "POST",
+      });
+      const config = payload && typeof payload.config === "object" ? payload.config : {};
+      setTerminalLoginConnected(Boolean(config.connected));
+      setTradingEngineEnabled(tradingEngineEnabled);
+      setText(brokerClientIdMsgEl, "Angel One terminal connected.");
     } catch (err) {
       setText(brokerClientIdMsgEl, `Terminal login failed: ${err.message}`);
     } finally {
-      if (!navigating) {
-        terminalLoginToggleEl.disabled = false;
-        terminalToggleBusy = false;
-      }
+      terminalLoginToggleEl.disabled = false;
+      terminalToggleBusy = false;
     }
   }
 
@@ -2970,6 +3016,17 @@
       }
     });
   }
+  [brokerApiKeyInputEl, brokerPinInputEl, brokerTotpInputEl].forEach(function (inputEl) {
+    if (!inputEl) {
+      return;
+    }
+    inputEl.addEventListener("keydown", function (event) {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        onBrokerClientIdSave();
+      }
+    });
+  });
   if (terminalLoginToggleEl) {
     terminalLoginToggleEl.addEventListener("click", onTerminalLoginToggle);
   }

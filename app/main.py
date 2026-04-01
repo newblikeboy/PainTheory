@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import secrets
+import struct
 import time
 import uuid
 from datetime import datetime, time as dt_time, timedelta, timezone
@@ -133,6 +134,9 @@ class LoginPayload(BaseModel):
 
 class BrokerClientIdPayload(BaseModel):
     client_id: str
+    api_key: str = ""
+    pin: str = ""
+    totp_secret: str = ""
 
 
 class TradingEnginePayload(BaseModel):
@@ -2329,6 +2333,7 @@ class CentralizedAngelExecutionManager:
                 "trade_id": int(trade_id),
                 "username": username,
                 "client_id": str(session.get("client_id") or "").strip(),
+                "api_key": str(session.get("api_key") or self.api_key or "").strip(),
                 "access_token": str(session.get("access_token") or "").strip(),
                 "symbol": str(row.get("symbol") or "").strip(),
                 "symbol_token": "",
@@ -2552,7 +2557,8 @@ class CentralizedAngelExecutionManager:
 
         task.add_done_callback(_log_task_result)
 
-    def _build_headers(self, access_token: str) -> Dict[str, str]:
+    def _build_headers(self, access_token: str, api_key: str = "") -> Dict[str, str]:
+        resolved_api_key = str(api_key or self.api_key or "").strip()
         return {
             "Authorization": f"Bearer {str(access_token or '').strip()}",
             "Content-Type": "application/json",
@@ -2562,7 +2568,7 @@ class CentralizedAngelExecutionManager:
             "X-ClientLocalIP": str(self.settings.angel_client_local_ip or "127.0.0.1"),
             "X-ClientPublicIP": str(self.settings.angel_client_public_ip or "0.0.0.0"),
             "X-MACAddress": str(self.settings.angel_client_mac or "00:00:00:00:00:00"),
-            "X-PrivateKey": self.api_key,
+            "X-PrivateKey": resolved_api_key,
         }
 
     @staticmethod
@@ -2629,6 +2635,7 @@ class CentralizedAngelExecutionManager:
         self,
         *,
         access_token: str,
+        api_key: str = "",
         symbol: str,
         exchange: str,
         contract_meta: Optional[Dict[str, Any]] = None,
@@ -2659,7 +2666,7 @@ class CentralizedAngelExecutionManager:
                     requests.post,
                     self.SEARCH_URL,
                     json=payload,
-                    headers=self._build_headers(token),
+                    headers=self._build_headers(token, api_key=api_key),
                     timeout=self.timeout_sec,
                 )
             except Exception:
@@ -2734,11 +2741,13 @@ class CentralizedAngelExecutionManager:
         self,
         *,
         access_token: str,
+        api_key: str = "",
         symbol: str,
         exchange: str,
     ) -> str:
         resolved = await self._resolve_option_instrument(
             access_token=access_token,
+            api_key=api_key,
             symbol=symbol,
             exchange=exchange,
             contract_meta={"symbol": symbol},
@@ -2806,6 +2815,7 @@ class CentralizedAngelExecutionManager:
         self,
         *,
         access_token: str,
+        api_key: str = "",
         symbol: str,
         symbol_token: str,
         exchange: str,
@@ -2855,7 +2865,7 @@ class CentralizedAngelExecutionManager:
                 requests.post,
                 self.ORDER_URL,
                 json=payload,
-                headers=self._build_headers(access_token),
+                headers=self._build_headers(access_token, api_key=api_key),
                 timeout=self.timeout_sec,
             )
         except Exception as exc:
@@ -2909,15 +2919,6 @@ class CentralizedAngelExecutionManager:
         async with self._dispatch_lock:
             trade_id = _to_int(active_trade.get("trade_id"), 0)
             if trade_id <= 0:
-                return
-            if not self.api_key:
-                self._last_event = {
-                    "type": "entry",
-                    "ts": int(time.time()),
-                    "ok": False,
-                    "trade_id": trade_id,
-                    "message": "ANGEL_API_KEY is missing.",
-                }
                 return
             if self._active_positions and self._active_trade_id != trade_id:
                 self._last_event = {
@@ -3003,15 +3004,35 @@ class CentralizedAngelExecutionManager:
                 self._active_trade_id = trade_id
                 self._active_positions = {}
                 return
+            eligible_sessions = [
+                session
+                for session in sessions
+                if str(session.get("access_token") or "").strip()
+                and str(session.get("api_key") or self.api_key or "").strip()
+            ]
+            if not eligible_sessions:
+                self._last_event = {
+                    "type": "entry",
+                    "ts": int(time.time()),
+                    "ok": False,
+                    "trade_id": trade_id,
+                    "message": "No connected users have both Angel access token and API key.",
+                    "total_users": len(sessions),
+                }
+                self._active_trade_id = trade_id
+                self._active_positions = {}
+                return
 
             if self._requires_angel_symbol_resolution(symbol, symbol_token):
                 resolved_instrument: Dict[str, str] = {}
-                for session in sessions:
+                for session in eligible_sessions:
                     access_token = str(session.get("access_token") or "").strip()
-                    if not access_token:
+                    api_key = str(session.get("api_key") or self.api_key or "").strip()
+                    if not access_token or not api_key:
                         continue
                     resolved_instrument = await self._resolve_option_instrument(
                         access_token=access_token,
+                        api_key=api_key,
                         symbol=symbol,
                         exchange=exchange,
                         contract_meta=contract_meta,
@@ -3044,15 +3065,17 @@ class CentralizedAngelExecutionManager:
             lot_size_qty = await asyncio.to_thread(self._resolve_global_lot_size_qty)
             placed: Dict[str, Dict[str, Any]] = {}
             failed = 0
-            for session in sessions:
+            for session in eligible_sessions:
                 username = str(session.get("username") or "").strip().lower()
                 access_token = str(session.get("access_token") or "").strip()
-                if not username or not access_token:
+                api_key = str(session.get("api_key") or self.api_key or "").strip()
+                if not username or not access_token or not api_key:
                     failed += 1
                     continue
                 order_quantity = self._resolve_order_quantity_for_session(session, lot_size_qty)
                 result = await self._place_order(
                     access_token=access_token,
+                    api_key=api_key,
                     symbol=symbol,
                     symbol_token=symbol_token,
                     exchange=exchange,
@@ -3072,6 +3095,7 @@ class CentralizedAngelExecutionManager:
                     "trade_id": int(trade_id),
                     "username": username,
                     "client_id": str(session.get("client_id") or "").strip(),
+                    "api_key": api_key,
                     "access_token": access_token,
                     "symbol": symbol,
                     "symbol_token": symbol_token,
@@ -3114,7 +3138,7 @@ class CentralizedAngelExecutionManager:
                 "exchange": exchange,
                 "lot_size_qty": int(lot_size_qty),
                 "quantity_mode": "lot_size_x_user_lots",
-                "total_users": len(sessions),
+                "total_users": len(eligible_sessions),
                 "placed_users": len(placed),
                 "failed_users": int(failed),
             }
@@ -3158,6 +3182,7 @@ class CentralizedAngelExecutionManager:
             for username, position in open_positions.items():
                 fresh = session_map.get(str(username).strip().lower(), {})
                 access_token = str(fresh.get("access_token") or position.get("access_token") or "").strip()
+                api_key = str(fresh.get("api_key") or position.get("api_key") or self.api_key or "").strip()
                 symbol = str(position.get("symbol") or "").strip()
                 symbol_token = str(position.get("symbol_token") or "").strip()
                 exchange = str(position.get("exchange") or self.exchange).strip().upper() or self.exchange
@@ -3171,6 +3196,7 @@ class CentralizedAngelExecutionManager:
                 if access_token and self._requires_angel_symbol_resolution(symbol, symbol_token):
                     resolved = await self._resolve_option_instrument(
                         access_token=access_token,
+                        api_key=api_key,
                         symbol=symbol,
                         exchange=exchange,
                         contract_meta=position,
@@ -3185,17 +3211,19 @@ class CentralizedAngelExecutionManager:
                         symbol = normalized["symbol"]
                         symbol_token = normalized["symbol_token"]
                         exchange = normalized["exchange"] or exchange
-                if not access_token or not symbol or not symbol_token:
+                if not access_token or not api_key or not symbol or not symbol_token:
                     logger.warning(
-                        "Live exit could not proceed for trade_id=%s user=%s symbol=%s access_token=%s symbol_token=%s",
+                        "Live exit could not proceed for trade_id=%s user=%s symbol=%s access_token=%s api_key=%s symbol_token=%s",
                         int(trade_id),
                         username,
                         symbol,
                         bool(access_token),
+                        bool(api_key),
                         bool(symbol_token),
                     )
                     failed_count += 1
                     saved = dict(position)
+                    saved["api_key"] = api_key
                     saved["symbol"] = symbol
                     saved["symbol_token"] = symbol_token
                     saved["exchange"] = exchange
@@ -3203,6 +3231,7 @@ class CentralizedAngelExecutionManager:
                     continue
                 result = await self._place_order(
                     access_token=access_token,
+                    api_key=api_key,
                     symbol=symbol,
                     symbol_token=symbol_token,
                     exchange=exchange,
@@ -4555,6 +4584,22 @@ def _urlsafe_b64_decode(text: str) -> bytes:
     return base64.urlsafe_b64decode((value + padding).encode("ascii"))
 
 
+def _normalize_base32_secret(secret: str) -> str:
+    text = re.sub(r"\s+", "", str(secret or "").strip()).upper()
+    padding = "=" * ((8 - (len(text) % 8)) % 8)
+    return text + padding
+
+
+def _generate_totp_code(secret: str, *, period: int = 30, digits: int = 6) -> str:
+    key = base64.b32decode(_normalize_base32_secret(secret), casefold=True)
+    counter = int(time.time() // max(1, int(period)))
+    message = struct.pack(">Q", counter)
+    digest = hmac.new(key, message, hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    code = struct.unpack(">I", digest[offset : offset + 4])[0] & 0x7FFFFFFF
+    return str(code % (10**digits)).zfill(digits)
+
+
 def _build_angel_state(username: str, secret: str, ttl_sec: int = 900) -> str:
     uname = str(username or "").strip().lower()
     if not uname:
@@ -4921,7 +4966,7 @@ async def startup_event() -> None:
     _preload_runtime_from_db(state)
     if state.live_execution.enabled:
         if not str(state.settings.angel_api_key or "").strip():
-            logger.warning("Central live execution is enabled but ANGEL_API_KEY is missing.")
+            logger.warning("Central live execution is enabled without a global ANGEL_API_KEY. Connected users must have saved Angel API keys.")
         else:
             logger.warning("Central live execution is ENABLED. Live orders will fan out to connected Angel users.")
     if state.settings.stream_mode == "fyers" and state.settings.fyers_refresh_enabled:
@@ -5736,7 +5781,106 @@ async def user_broker_angel_one_update(
     user = _require_user(state, _authorization_from_request(authorization, request))
     username = str(user.get("email") or user.get("username") or "").strip().lower()
     try:
-        config = state.user_auth.set_user_broker_client_id(username, payload.client_id)
+        config = state.user_auth.set_user_broker_profile(
+            username,
+            client_id=payload.client_id,
+            api_key=payload.api_key,
+            pin=payload.pin,
+            totp_secret=payload.totp_secret,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return {"ok": True, "config": config}
+
+
+@app.post("/user/broker/angel-one/login")
+async def user_broker_angel_one_login(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    state: AppState = app.state.state
+    user = _require_user(state, _authorization_from_request(authorization, request))
+    username = str(user.get("email") or user.get("username") or "").strip().lower()
+    try:
+        session = state.user_auth.get_user_angel_session(username)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    client_id = str(session.get("client_id") or "").strip()
+    api_key = str(session.get("api_key") or state.settings.angel_api_key or "").strip()
+    pin = str(session.get("pin") or "").strip()
+    totp_secret = str(session.get("totp_secret") or "").strip()
+    if not client_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Set Angel client id first.")
+    if not api_key:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Set Angel API key first.")
+    if not pin:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Set Angel PIN first.")
+    if not totp_secret:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Set Angel TOTP secret first.")
+
+    try:
+        totp_code = _generate_totp_code(totp_secret)
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid Angel TOTP secret: {exc}") from exc
+
+    payload = {
+        "clientcode": client_id,
+        "password": pin,
+        "totp": totp_code,
+        "state": f"terminal-{int(time.time())}",
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-UserType": "USER",
+        "X-SourceID": "WEB",
+        "X-ClientLocalIP": str(state.settings.angel_client_local_ip or "127.0.0.1"),
+        "X-ClientPublicIP": str(state.settings.angel_client_public_ip or "0.0.0.0"),
+        "X-MACAddress": str(state.settings.angel_client_mac or "00:00:00:00:00:00"),
+        "X-PrivateKey": api_key,
+    }
+    try:
+        resp = await asyncio.to_thread(
+            requests.post,
+            "https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword",
+            json=payload,
+            headers=headers,
+            timeout=15,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Angel terminal login request failed: {exc}") from exc
+
+    try:
+        body = resp.json() if resp.content else {}
+    except ValueError:
+        body = {}
+    if int(getattr(resp, "status_code", 500)) >= 400:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Angel terminal login HTTP {resp.status_code}.")
+    if isinstance(body, dict) and body.get("status") is False:
+        message = str(body.get("message") or body.get("errorcode") or "Angel login failed").strip()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message)
+
+    data = body.get("data") if isinstance(body, dict) else {}
+    access_token = str((data or {}).get("jwtToken") or "").strip()
+    refresh_token = str((data or {}).get("refreshToken") or "").strip()
+    feed_token = str((data or {}).get("feedToken") or "").strip()
+    if not access_token:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Angel login succeeded but jwtToken was missing.")
+
+    decoded = _jwt_payload(access_token)
+    token_expires_at = _to_int(decoded.get("exp"), 0)
+    try:
+        state.user_auth.save_user_angel_session(
+            username=username,
+            client_id=client_id,
+            auth_token="",
+            access_token=access_token,
+            feed_token=feed_token,
+            refresh_token=refresh_token,
+            token_expires_at=token_expires_at,
+        )
+        config = state.user_auth.get_user_broker_config(username)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return {"ok": True, "config": config}
@@ -6056,12 +6200,11 @@ async def user_report_trades(
 
     access_token = str(session.get("access_token") or "").strip()
     client_id = str(session.get("client_id") or "").strip()
+    api_key = str(session.get("api_key") or state.settings.angel_api_key or "").strip()
     if not access_token or not client_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Angel session is incomplete. Reconnect terminal login.")
-
-    api_key = str(state.settings.angel_api_key or "").strip()
     if not api_key:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="ANGEL_API_KEY is not configured.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Angel API key is not configured.")
 
     headers = {
         "Authorization": f"Bearer {access_token}",

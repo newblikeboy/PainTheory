@@ -191,6 +191,9 @@ class MySQLUserAuthStore(UserAuthStore):
                     full_name VARCHAR(120) NOT NULL,
                     mobile_number VARCHAR(20) NOT NULL UNIQUE,
                     angel_one_client_id VARCHAR(64) NULL,
+                    angel_one_api_key VARCHAR(128) NULL,
+                    angel_one_pin VARCHAR(64) NULL,
+                    angel_one_totp_secret TEXT NULL,
                     angel_one_connected TINYINT(1) NOT NULL DEFAULT 0,
                     trading_engine_enabled TINYINT(1) NOT NULL DEFAULT 0,
                     user_lot_count INT NOT NULL DEFAULT 1,
@@ -372,6 +375,30 @@ class MySQLUserAuthStore(UserAuthStore):
                 """,
             )
             ensure_column(
+                "angel_one_api_key",
+                """
+                ALTER TABLE auth_users
+                ADD COLUMN angel_one_api_key VARCHAR(128) NULL
+                AFTER angel_one_client_id
+                """,
+            )
+            ensure_column(
+                "angel_one_pin",
+                """
+                ALTER TABLE auth_users
+                ADD COLUMN angel_one_pin VARCHAR(64) NULL
+                AFTER angel_one_api_key
+                """,
+            )
+            ensure_column(
+                "angel_one_totp_secret",
+                """
+                ALTER TABLE auth_users
+                ADD COLUMN angel_one_totp_secret TEXT NULL
+                AFTER angel_one_pin
+                """,
+            )
+            ensure_column(
                 "angel_one_auth_token",
                 """
                 ALTER TABLE auth_users
@@ -548,6 +575,46 @@ class MySQLUserAuthStore(UserAuthStore):
         if not re.fullmatch(r"[A-Za-z0-9._\-]+", text):
             raise ValueError("client id contains invalid characters")
         return text
+
+    @staticmethod
+    def _normalize_angel_api_key(value: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if len(text) > 128:
+            raise ValueError("api key must be at most 128 characters")
+        if not re.fullmatch(r"[A-Za-z0-9._\-]+", text):
+            raise ValueError("api key contains invalid characters")
+        return text
+
+    @staticmethod
+    def _normalize_angel_pin(value: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if len(text) > 64:
+            raise ValueError("pin must be at most 64 characters")
+        return text
+
+    @staticmethod
+    def _normalize_angel_totp_secret(value: str) -> str:
+        text = re.sub(r"\s+", "", str(value or "").strip()).upper()
+        if not text:
+            return ""
+        if len(text) > 256:
+            raise ValueError("totp secret must be at most 256 characters")
+        if not re.fullmatch(r"[A-Z2-7=]+", text):
+            raise ValueError("totp secret contains invalid characters")
+        return text
+
+    @staticmethod
+    def _mask_secret(value: Any, keep: int = 4) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if len(text) <= keep:
+            return "*" * len(text)
+        return ("*" * max(0, len(text) - keep)) + text[-keep:]
 
     @staticmethod
     def _normalize_user_lot_count(value: Any) -> int:
@@ -952,7 +1019,8 @@ class MySQLUserAuthStore(UserAuthStore):
                 cur = conn.cursor(dictionary=True)
                 cur.execute(
                     """
-                    SELECT email, angel_one_client_id, angel_one_connected, trading_engine_enabled, user_lot_count,
+                    SELECT email, angel_one_client_id, angel_one_api_key, angel_one_pin, angel_one_totp_secret,
+                           angel_one_connected, trading_engine_enabled, user_lot_count,
                            subscription_active, subscription_plan_code, subscription_plan_name,
                            subscription_started_at, subscription_expires_at,
                            angel_one_exchanged_at
@@ -971,6 +1039,16 @@ class MySQLUserAuthStore(UserAuthStore):
                     "username": self._to_row_value(row, "email", normalized),
                     "broker": "angel_one",
                     "client_id": self._to_row_value(row, "angel_one_client_id"),
+                    "api_key_saved": bool(self._to_row_value(row, "angel_one_api_key")),
+                    "api_key_hint": self._mask_secret(self._to_row_value(row, "angel_one_api_key")),
+                    "pin_saved": bool(self._to_row_value(row, "angel_one_pin")),
+                    "totp_secret_saved": bool(self._to_row_value(row, "angel_one_totp_secret")),
+                    "has_login_credentials": bool(
+                        self._to_row_value(row, "angel_one_client_id")
+                        and self._to_row_value(row, "angel_one_api_key")
+                        and self._to_row_value(row, "angel_one_pin")
+                        and self._to_row_value(row, "angel_one_totp_secret")
+                    ),
                     "connected": _to_int(row.get("angel_one_connected"), 0) > 0,
                     "trading_engine_enabled": _to_int(row.get("trading_engine_enabled"), 0) > 0 and paid_active,
                     "user_lot_count": self._normalize_user_lot_count(row.get("user_lot_count")),
@@ -1195,21 +1273,55 @@ class MySQLUserAuthStore(UserAuthStore):
                 if conn is not None:
                     conn.close()
 
-    def set_user_broker_client_id(self, username: str, client_id: str) -> Dict[str, Any]:
+    def set_user_broker_profile(
+        self,
+        username: str,
+        *,
+        client_id: str = "",
+        api_key: str = "",
+        pin: str = "",
+        totp_secret: str = "",
+    ) -> Dict[str, Any]:
         normalized = self._normalize_email(username)
         if not normalized:
             raise ValueError("username is required")
         normalized_client_id = self._normalize_angel_client_id(client_id)
+        normalized_api_key = self._normalize_angel_api_key(api_key)
+        normalized_pin = self._normalize_angel_pin(pin)
+        normalized_totp_secret = self._normalize_angel_totp_secret(totp_secret)
         conn = None
         cur = None
         with self._lock:
             try:
                 conn = self._connect(with_database=True)
+                cur = conn.cursor(dictionary=True)
+                cur.execute(
+                    """
+                    SELECT angel_one_client_id, angel_one_api_key, angel_one_pin, angel_one_totp_secret
+                    FROM auth_users
+                    WHERE email = %s
+                    LIMIT 1
+                    """,
+                    (normalized,),
+                )
+                before = cur.fetchone()
+                if not isinstance(before, dict):
+                    raise ValueError("user not found")
+                merged_client_id = normalized_client_id or self._to_row_value(before, "angel_one_client_id")
+                merged_api_key = normalized_api_key or self._to_row_value(before, "angel_one_api_key")
+                merged_pin = normalized_pin or self._to_row_value(before, "angel_one_pin")
+                merged_totp_secret = normalized_totp_secret or self._to_row_value(before, "angel_one_totp_secret")
+                if not merged_client_id:
+                    raise ValueError("client id is required")
+                cur.close()
                 cur = conn.cursor()
                 cur.execute(
                     """
                     UPDATE auth_users
                     SET angel_one_client_id = %s,
+                        angel_one_api_key = %s,
+                        angel_one_pin = %s,
+                        angel_one_totp_secret = %s,
                         angel_one_connected = 0,
                         angel_one_auth_token = NULL,
                         angel_one_access_token = NULL,
@@ -1219,7 +1331,13 @@ class MySQLUserAuthStore(UserAuthStore):
                         angel_one_exchanged_at = NULL
                     WHERE email = %s
                     """,
-                    (normalized_client_id or None, normalized),
+                    (
+                        merged_client_id or None,
+                        merged_api_key or None,
+                        merged_pin or None,
+                        merged_totp_secret or None,
+                        normalized,
+                    ),
                 )
                 if int(cur.rowcount or 0) <= 0:
                     raise ValueError("user not found")
@@ -1229,13 +1347,10 @@ class MySQLUserAuthStore(UserAuthStore):
                     cur.close()
                 if conn is not None:
                     conn.close()
-        return {
-            "username": normalized,
-            "broker": "angel_one",
-            "client_id": normalized_client_id,
-            "connected": False,
-            "exchanged_at": 0,
-        }
+        return self.get_user_broker_config(normalized)
+
+    def set_user_broker_client_id(self, username: str, client_id: str) -> Dict[str, Any]:
+        return self.set_user_broker_profile(username, client_id=client_id)
 
     def save_user_angel_session(
         self,
@@ -1402,6 +1517,9 @@ class MySQLUserAuthStore(UserAuthStore):
                     SELECT
                         email,
                         angel_one_client_id,
+                        angel_one_api_key,
+                        angel_one_pin,
+                        angel_one_totp_secret,
                         angel_one_connected,
                         trading_engine_enabled,
                         user_lot_count,
@@ -1430,6 +1548,9 @@ class MySQLUserAuthStore(UserAuthStore):
                 return {
                     "username": self._to_row_value(row, "email", normalized),
                     "client_id": self._to_row_value(row, "angel_one_client_id"),
+                    "api_key": self._to_row_value(row, "angel_one_api_key"),
+                    "pin": self._to_row_value(row, "angel_one_pin"),
+                    "totp_secret": self._to_row_value(row, "angel_one_totp_secret"),
                     "connected": _to_int(row.get("angel_one_connected"), 0) > 0,
                     "trading_engine_enabled": _to_int(row.get("trading_engine_enabled"), 0) > 0 and paid_active,
                     "user_lot_count": self._normalize_user_lot_count(row.get("user_lot_count")),
@@ -1465,6 +1586,7 @@ class MySQLUserAuthStore(UserAuthStore):
                     SELECT
                         email,
                         angel_one_client_id,
+                        angel_one_api_key,
                         angel_one_connected,
                         trading_engine_enabled,
                         user_lot_count,
@@ -1505,6 +1627,7 @@ class MySQLUserAuthStore(UserAuthStore):
                         {
                             "username": self._to_row_value(row, "email"),
                             "client_id": self._to_row_value(row, "angel_one_client_id"),
+                            "api_key": self._to_row_value(row, "angel_one_api_key"),
                             "connected": _to_int(row.get("angel_one_connected"), 0) > 0,
                             "trading_engine_enabled": _to_int(row.get("trading_engine_enabled"), 0) > 0 and paid_active,
                             "user_lot_count": self._normalize_user_lot_count(row.get("user_lot_count")),

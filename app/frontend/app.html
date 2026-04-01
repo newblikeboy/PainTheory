@@ -154,17 +154,41 @@
         <article class="card view-card">
           <div class="line-head">
             <h2>Broker - Angel One</h2>
-            <span class="small">Client ID Setup</span>
+            <span class="small">Terminal Credentials</span>
           </div>
-          <p class="small">Add or update your Angel One Client ID. You can change it anytime.</p>
+          <p class="small">Save your Angel terminal credentials here. Terminal Login will fetch tokens directly from the backend without redirecting to publisher login.</p>
           <div class="broker-card">
             <div class="profile-row">
               <span>Saved Client ID</span>
               <strong id="broker-client-id-value">Not set</strong>
             </div>
+            <div class="profile-row">
+              <span>Saved API Key</span>
+              <strong id="broker-api-key-value">Not saved</strong>
+            </div>
+            <div class="profile-row">
+              <span>Saved PIN</span>
+              <strong id="broker-pin-value">Not saved</strong>
+            </div>
+            <div class="profile-row">
+              <span>Saved TOTP Secret</span>
+              <strong id="broker-totp-value">Not saved</strong>
+            </div>
             <label class="field">
               <span>Angel One Client ID</span>
               <input id="broker-client-id-input" class="text-input" type="text" placeholder="Enter client id">
+            </label>
+            <label class="field">
+              <span>API Key</span>
+              <input id="broker-api-key-input" class="text-input" type="text" placeholder="Enter Angel SmartAPI key">
+            </label>
+            <label class="field">
+              <span>PIN</span>
+              <input id="broker-pin-input" class="text-input" type="password" placeholder="Enter Angel PIN">
+            </label>
+            <label class="field">
+              <span>TOTP Secret</span>
+              <input id="broker-totp-input" class="text-input" type="password" placeholder="Enter base32 TOTP secret">
             </label>
             <div class="action-row">
               <button id="broker-client-id-save-btn" class="action-btn" type="button">Save / Update</button>
