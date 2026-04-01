@@ -96,6 +96,16 @@ def normalize_option_symbol(value: Any) -> str:
     return text
 
 
+def display_option_symbol(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if not text:
+        return ""
+    text = text.replace(" ", "")
+    text = text.replace("-", "")
+    text = text.replace("_", "")
+    return text
+
+
 def _normalize_underlying(value: Any) -> str:
     text = str(value or "").strip().upper()
     if ":" in text:
@@ -347,6 +357,7 @@ def extract_option_contract(
         )
     else:
         symbol_raw = source
+    display_symbol = display_option_symbol(symbol_raw)
     symbol = normalize_option_symbol(symbol_raw)
     option_type = str(
         explicit_option_type
@@ -409,7 +420,8 @@ def extract_option_contract(
 
     trade_ts = _to_int(snapshot_ts or (row.get("timestamp") if isinstance(source, dict) else 0), 0)
     contract = {
-        "symbol": symbol,
+        "symbol": display_symbol or symbol,
+        "symbol_normalized": symbol,
         "symbol_token": symbol_token,
         "exchange": exchange,
         "underlying": underlying,
