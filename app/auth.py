@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fyers_apiv3 import fyersModel
-import requests
 
 from .config import mysql_connect_kwargs_from_parts
 
@@ -1780,6 +1779,16 @@ class FyersAuthManager:
                 "refresh_valid": refresh_valid,
             }
 
+    def get_active_access_token(self) -> str:
+        with self._lock:
+            auth = self._read_auth()
+            now = _now()
+            access_token = str(auth.get("access_token") or "").strip()
+            access_exp = _to_int(auth.get("access_token_expires_at"), 0)
+            if access_token and access_exp > now + 5:
+                return access_token
+            return ""
+
     def generate_login_url(self, state: str = "pain-theory-ai") -> str:
         with self._lock:
             if not self.client_id:
@@ -1806,45 +1815,4 @@ class FyersAuthManager:
             return saved
 
     def refresh_access_token(self, force: bool = False) -> Dict[str, Any]:
-        with self._lock:
-            previous = self._read_auth()
-            now = _now()
-            access_exp = _to_int(previous.get("access_token_expires_at"), 0)
-            needs_refresh = bool(access_exp and access_exp <= now + self.refresh_lead_sec)
-            if not force and not needs_refresh:
-                return {
-                    "refreshed": False,
-                    "authenticated": bool(access_exp > now + 5),
-                    "access_token": str(previous.get("access_token", "")).strip(),
-                    "access_token_expires_at": access_exp,
-                }
-
-            refresh_token = str(previous.get("refresh_token") or "").strip()
-            if not refresh_token:
-                raise RuntimeError("refresh_token is missing; re-authenticate with FYERS")
-            if not self.secret_key:
-                raise RuntimeError("FYERS secret key is missing")
-            payload: Dict[str, Any] = {
-                "grant_type": "refresh_token",
-                "appIdHash": self._app_id_hash(),
-                "refresh_token": refresh_token,
-            }
-            if self.pin:
-                payload["pin"] = self.pin
-            response = requests.post(
-                "https://api-t1.fyers.in/api/v3/validate-refresh-token",
-                json=payload,
-                timeout=12,
-            )
-            try:
-                raw = response.json()
-            except ValueError:
-                raw = {
-                    "s": "error",
-                    "code": int(response.status_code),
-                    "message": response.text or "Unable to parse FYERS refresh response",
-                }
-            saved = self._persist_tokens(raw, previous=previous)
-            saved["refreshed"] = True
-            saved["authenticated"] = True
-            return saved
+        raise RuntimeError("FYERS refresh-token flow has been removed. Re-authenticate with a new auth code.")

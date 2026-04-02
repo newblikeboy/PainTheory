@@ -13,7 +13,6 @@ import uuid
 from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
@@ -166,10 +165,6 @@ class RazorpayVerifyPayload(BaseModel):
 
 class FyersExchangePayload(BaseModel):
     auth_code: str
-
-
-class FyersRefreshPayload(BaseModel):
-    force: bool = False
 
 
 class PaperResetPayload(BaseModel):
@@ -2511,6 +2506,14 @@ class CentralizedAngelExecutionManager:
             return cls._normalize_option_trading_symbol(fallback)
         return cls._normalize_option_trading_symbol(raw_symbol)
 
+    @classmethod
+    def _resolve_execution_exchange(cls, *, symbol: Any, exchange: Any, fallback_exchange: str) -> str:
+        resolved_exchange = str(exchange or fallback_exchange).strip().upper()
+        fallback = str(fallback_exchange or resolved_exchange).strip().upper()
+        if cls._looks_like_option_symbol(symbol) and fallback:
+            return fallback
+        return resolved_exchange or fallback
+
     @staticmethod
     def _extract_order_id(payload: Any) -> str:
         if isinstance(payload, dict):
@@ -2948,7 +2951,11 @@ class CentralizedAngelExecutionManager:
                 active_trade=active_trade,
             )
             symbol_token = str(raw_token or "").strip()
-            exchange = str(raw_exchange or self.exchange).strip().upper() or self.exchange
+            exchange = self._resolve_execution_exchange(
+                symbol=symbol,
+                exchange=raw_exchange,
+                fallback_exchange=self.exchange,
+            )
             contract_meta = extract_option_contract(
                 {
                     "symbol": symbol,
@@ -3185,7 +3192,11 @@ class CentralizedAngelExecutionManager:
                 api_key = str(fresh.get("api_key") or position.get("api_key") or self.api_key or "").strip()
                 symbol = str(position.get("symbol") or "").strip()
                 symbol_token = str(position.get("symbol_token") or "").strip()
-                exchange = str(position.get("exchange") or self.exchange).strip().upper() or self.exchange
+                exchange = self._resolve_execution_exchange(
+                    symbol=symbol,
+                    exchange=position.get("exchange"),
+                    fallback_exchange=self.exchange,
+                )
                 quantity = max(
                     1,
                     _to_int(
@@ -3535,29 +3546,30 @@ def _fyers_readiness(state: AppState) -> Dict[str, Any]:
         return {"ok": True, "mode": runtime["stream_mode"], "detail": "FYERS stream disabled"}
     status = state.fyers_auth.get_status()
     access_sec = int(status.get("seconds_to_access_expiry") or 0)
-    refresh_sec = int(status.get("seconds_to_refresh_expiry") or 0)
-    has_refresh = bool(status.get("has_refresh_token"))
-    refresh_valid = bool(status.get("refresh_valid"))
     authenticated = bool(status.get("authenticated"))
     has_secret = bool(str(state.settings.fyers_secret_key or "").strip())
     has_client_id = bool(str(state.settings.fyers_client_id or status.get("client_id") or "").strip())
-    refresh_configured = bool(has_secret and has_client_id)
-    # If access token is near expiry but refresh token is valid, runtime can recover automatically.
-    ok = bool((authenticated and access_sec > 5) or (has_refresh and refresh_valid and refresh_configured))
+    ok = bool(authenticated and access_sec > 5)
     return {
         "ok": ok,
         "authenticated": authenticated,
         "has_access_token": bool(status.get("has_access_token")),
-        "has_refresh_token": has_refresh,
-        "refresh_valid": refresh_valid,
-        "refresh_configured": refresh_configured,
         "has_secret_key": has_secret,
         "has_client_id": has_client_id,
-        "needs_refresh": bool(status.get("needs_refresh")),
         "access_token_expires_at": int(status.get("access_token_expires_at") or 0),
-        "refresh_token_expires_at": int(status.get("refresh_token_expires_at") or 0),
         "seconds_to_access_expiry": access_sec,
-        "seconds_to_refresh_expiry": refresh_sec,
+    }
+
+
+def _fyers_status_payload(state: AppState) -> Dict[str, Any]:
+    status = state.fyers_auth.get_status()
+    return {
+        "authenticated": bool(status.get("authenticated")),
+        "has_access_token": bool(status.get("has_access_token")),
+        "client_id": str(status.get("client_id") or state.settings.fyers_client_id or "").strip(),
+        "generated_at": int(status.get("generated_at") or 0),
+        "access_token_expires_at": int(status.get("access_token_expires_at") or 0),
+        "seconds_to_access_expiry": int(status.get("seconds_to_access_expiry") or 0),
     }
 
 
@@ -3579,7 +3591,7 @@ def _system_ready_payload(state: AppState) -> Dict[str, Any]:
     if int((db_info.get("future_rows", {}) or {}).get("candles_5m", 0)) > 0:
         issues.append("Future-dated rows found in 5m candles.")
     if not fyers_info.get("ok", False):
-        issues.append("FYERS auth/refresh is not ready.")
+        issues.append("FYERS access token is not ready.")
 
     ready = bool(db_info.get("ok", False) and fyers_info.get("ok", False))
     summary = "Ready for market-open test." if ready else "Not ready. Fix listed issues."
@@ -3685,74 +3697,14 @@ def _apply_fyers_access_token(state: AppState, token: str, *, reason: str) -> bo
     return changed
 
 
-async def _force_fyers_token_refresh(state: AppState, reason: str) -> bool:
-    if state.settings.stream_mode != "fyers":
+def _clear_fyers_access_token(state: AppState, *, reason: str) -> bool:
+    previous_token = str(state.settings.fyers_access_token or "").strip()
+    if not previous_token:
         return False
-    if not state.settings.fyers_refresh_enabled:
-        return False
-    for attempt in range(1, 4):
-        try:
-            refreshed = await asyncio.to_thread(state.fyers_auth.refresh_access_token, force=True)
-            token = str(refreshed.get("access_token", "")).strip()
-            if not token:
-                if attempt < 3:
-                    await asyncio.sleep(float(attempt))
-                    continue
-                return False
-            _apply_fyers_access_token(state, token, reason=reason)
-            logger.warning("FYERS token refreshed after %s (attempt=%s)", reason, attempt)
-            return True
-        except Exception as exc:
-            if attempt >= 3:
-                logger.warning("FYERS forced refresh failed after %s: %s", reason, exc)
-                return False
-            await asyncio.sleep(float(attempt))
-    return False
-
-
-async def _fyers_startup_token_bootstrap(state: AppState, *, max_wait_sec: int = 60) -> bool:
-    if state.settings.stream_mode != "fyers":
-        return False
-    if not state.settings.fyers_refresh_enabled:
-        return False
-
-    deadline = int(time.time()) + max(5, int(max_wait_sec))
-    while True:
-        try:
-            status = await asyncio.to_thread(state.fyers_auth.get_status)
-        except Exception as exc:
-            logger.warning("FYERS startup status check failed: %s", exc)
-            status = {}
-
-        access_valid = bool(status.get("authenticated"))
-        has_refresh = bool(status.get("has_refresh_token"))
-        refresh_valid = bool(status.get("refresh_valid"))
-        if access_valid:
-            # Pull current token payload from auth manager and apply it to all clients.
-            try:
-                current = await asyncio.to_thread(state.fyers_auth.refresh_access_token, force=False)
-                token = str(current.get("access_token", "")).strip()
-                if token:
-                    _apply_fyers_access_token(state, token, reason="startup token bootstrap")
-                    return True
-            except Exception as exc:
-                logger.warning("FYERS startup bootstrap read failed: %s", exc)
-
-        if not has_refresh or not refresh_valid:
-            # No valid refresh path left; require interactive re-auth.
-            state.settings.fyers_access_token = ""
-            logger.warning("FYERS refresh token unavailable/expired at startup; re-authentication is required.")
-            return False
-
-        if await _force_fyers_token_refresh(state, reason="startup bootstrap refresh"):
-            return True
-
-        if int(time.time()) >= deadline:
-            # Continue startup with background retries; avoid using stale token immediately.
-            state.settings.fyers_access_token = ""
-            logger.warning("FYERS startup bootstrap timed out; background refresh loop will keep retrying.")
-            return False
-        await asyncio.sleep(3)
+    state.settings.fyers_access_token = ""
+    state.fyers_token_generation += 1
+    logger.warning("FYERS access token cleared after %s; manual re-authentication is required.", reason)
+    return True
 
 
 def _option_snapshot_signature(snapshot: Dict[str, Any]) -> tuple[Any, ...]:
@@ -4191,7 +4143,7 @@ async def stream_loop(state: AppState) -> None:
         except Exception as exc:
             logger.exception("Stream loop crashed: %s", exc)
             if _is_fyers_auth_error(exc):
-                await _force_fyers_token_refresh(state, reason="stream auth error")
+                _clear_fyers_access_token(state, reason="stream auth error")
             await asyncio.sleep(5)
 
 
@@ -4266,58 +4218,8 @@ async def option_chain_loop(state: AppState) -> None:
         except Exception as exc:
             logger.exception("Option chain loop crashed: %s", exc)
             if _is_fyers_auth_error(exc):
-                await _force_fyers_token_refresh(state, reason="option chain auth error")
+                _clear_fyers_access_token(state, reason="option chain auth error")
             await asyncio.sleep(5)
-
-
-async def fyers_refresh_loop(state: AppState) -> None:
-    force_interval_sec = 3600
-    last_forced_ts = 0
-    while True:
-        try:
-            if state.settings.stream_mode != "fyers":
-                await asyncio.sleep(15)
-                continue
-            if not state.settings.fyers_refresh_enabled:
-                await asyncio.sleep(15)
-                continue
-            status = await asyncio.to_thread(state.fyers_auth.get_status)
-            has_refresh = bool(status.get("has_refresh_token"))
-            refresh_valid = bool(status.get("refresh_valid"))
-            access_valid = bool(status.get("authenticated"))
-            needs_refresh = bool(status.get("needs_refresh"))
-            if not has_refresh:
-                state.settings.fyers_access_token = ""
-                await asyncio.sleep(max(15, int(state.settings.fyers_refresh_check_sec)))
-                continue
-            if not refresh_valid:
-                state.settings.fyers_access_token = ""
-                logger.warning("FYERS refresh token is expired/invalid; re-authentication required.")
-                await asyncio.sleep(max(15, int(state.settings.fyers_refresh_check_sec)))
-                continue
-            now_ts = int(time.time())
-            force_now = bool(
-                (not access_valid)
-                or needs_refresh
-                or last_forced_ts <= 0
-                or now_ts - last_forced_ts >= force_interval_sec
-            )
-            refreshed = await asyncio.to_thread(state.fyers_auth.refresh_access_token, force=force_now)
-            token = str(refreshed.get("access_token", "")).strip()
-            if token:
-                _apply_fyers_access_token(state, token, reason="refresh loop")
-                if force_now:
-                    last_forced_ts = now_ts
-                    logger.info("FYERS access token refreshed via hourly force cycle.")
-        except Exception as exc:
-            logger.exception("FYERS token refresh loop error: %s", exc)
-        # Retry aggressively when refresh token is valid but access token is missing/expired.
-        try:
-            after = await asyncio.to_thread(state.fyers_auth.get_status)
-            urgent = bool(after.get("has_refresh_token") and after.get("refresh_valid") and not after.get("authenticated"))
-        except Exception:
-            urgent = False
-        await asyncio.sleep(5 if urgent else max(15, int(state.settings.fyers_refresh_check_sec)))
 
 
 async def paper_quote_loop(state: AppState) -> None:
@@ -4368,6 +4270,8 @@ async def paper_quote_loop(state: AppState) -> None:
                 )
         except Exception as exc:
             logger.exception("Paper quote loop error: %s", exc)
+            if _is_fyers_auth_error(exc):
+                _clear_fyers_access_token(state, reason="paper quote auth error")
         await asyncio.sleep(sleep_sec)
 
 
@@ -4577,10 +4481,6 @@ def _authorization_from_request(authorization: Optional[str], request: Optional[
     return ""
 
 
-def _urlsafe_b64_no_pad(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-
-
 def _urlsafe_b64_decode(text: str) -> bytes:
     value = str(text or "").strip()
     if not value:
@@ -4603,101 +4503,6 @@ def _generate_totp_code(secret: str, *, period: int = 30, digits: int = 6) -> st
     offset = digest[-1] & 0x0F
     code = struct.unpack(">I", digest[offset : offset + 4])[0] & 0x7FFFFFFF
     return str(code % (10**digits)).zfill(digits)
-
-
-def _build_angel_state(username: str, secret: str, ttl_sec: int = 900) -> str:
-    uname = str(username or "").strip().lower()
-    if not uname:
-        return ""
-    payload = {
-        "u": uname,
-        "exp": int(time.time()) + max(60, int(ttl_sec or 900)),
-        "n": secrets.token_urlsafe(12),
-    }
-    body = _urlsafe_b64_no_pad(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
-    signature = hmac.new(str(secret or "").encode("utf-8"), body.encode("ascii"), hashlib.sha256).digest()
-    return f"{body}.{_urlsafe_b64_no_pad(signature)}"
-
-
-def _parse_angel_state(token: str, secret: str) -> str:
-    value = str(token or "").strip()
-    if not value or "." not in value:
-        return ""
-    body, sig = value.split(".", 1)
-    if not body or not sig:
-        return ""
-    expected_sig = hmac.new(str(secret or "").encode("utf-8"), body.encode("ascii"), hashlib.sha256).digest()
-    provided_sig = _urlsafe_b64_decode(sig)
-    if not provided_sig or not hmac.compare_digest(expected_sig, provided_sig):
-        return ""
-    try:
-        payload = json.loads(_urlsafe_b64_decode(body).decode("utf-8"))
-    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
-        return ""
-    if not isinstance(payload, dict):
-        return ""
-    exp = _to_int(payload.get("exp"), 0)
-    if exp <= int(time.time()):
-        return ""
-    return str(payload.get("u") or "").strip().lower()
-
-
-def _resolve_angel_redirect_url(settings: Settings, request: Request) -> str:
-    configured = str(settings.angel_redirect_url or "").strip()
-    if configured:
-        return configured
-    app_host = str(settings.app_host or "").strip().rstrip("/")
-    if app_host:
-        return f"{app_host}/auth/angel/callback"
-    scheme = str(request.url.scheme or "http")
-    host = str(request.headers.get("host", "")).strip()
-    if host:
-        return f"{scheme}://{host}/auth/angel/callback"
-    return "http://localhost:8000/auth/angel/callback"
-
-
-def _append_query(base_url: str, params: Dict[str, str]) -> str:
-    split = urlsplit(base_url)
-    existing = parse_qs(split.query, keep_blank_values=True)
-    for key, value in params.items():
-        existing[str(key)] = [str(value)]
-    pairs: List[tuple[str, str]] = []
-    for key, values in existing.items():
-        for value in values:
-            pairs.append((str(key), str(value)))
-    query = urlencode(pairs)
-    return urlunsplit((split.scheme, split.netloc, split.path, query, split.fragment))
-
-
-def _parse_angel_callback_query(request: Request) -> Dict[str, Any]:
-    raw_query = str(request.url.query or "")
-    parsed = parse_qs(raw_query, keep_blank_values=True)
-
-    def pick(*names: str) -> str:
-        for name in names:
-            values = parsed.get(name)
-            if not values:
-                continue
-            for value in values:
-                text = str(value or "").strip()
-                if text:
-                    return text
-        return ""
-
-    return {
-        "auth_token": pick("auth_token"),
-        "feed_token": pick("feed_token"),
-        "refresh_token": pick("refresh_token"),
-        "state": pick("state"),
-        "raw": {
-            "clientcode": pick("clientcode"),
-            "client_id": pick("clientId", "client_id"),
-            "username": pick("username"),
-            "user_id": pick("userId", "user_id"),
-        },
-    }
-
-
 def _jwt_payload(token: str) -> Dict[str, Any]:
     parts = str(token or "").split(".")
     if len(parts) < 2:
@@ -4710,31 +4515,6 @@ def _jwt_payload(token: str) -> Dict[str, Any]:
     except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
         return {}
     return {}
-
-
-def _extract_angel_client_id(decoded: Dict[str, Any], raw: Dict[str, Any]) -> str:
-    candidates = [
-        decoded.get("username"),
-        decoded.get("clientcode"),
-        decoded.get("clientCode"),
-        decoded.get("clientId"),
-        decoded.get("clientID"),
-        decoded.get("client_id"),
-        decoded.get("userId"),
-        decoded.get("userID"),
-        decoded.get("user_id"),
-        raw.get("clientcode"),
-        raw.get("client_id"),
-        raw.get("username"),
-        raw.get("user_id"),
-    ]
-    for value in candidates:
-        text = str(value or "").strip()
-        if text:
-            return text
-    return ""
-
-
 def _parse_angel_trade_timestamp(row: Dict[str, Any]) -> int:
     candidates = [
         row.get("filltime"),
@@ -4974,12 +4754,17 @@ async def startup_event() -> None:
             logger.warning("Central live execution is enabled without a global ANGEL_API_KEY. Connected users must have saved Angel API keys.")
         else:
             logger.warning("Central live execution is ENABLED. Live orders will fan out to connected Angel users.")
-    if state.settings.stream_mode == "fyers" and state.settings.fyers_refresh_enabled:
-        await _fyers_startup_token_bootstrap(state, max_wait_sec=60)
+    if state.settings.stream_mode == "fyers" and not str(state.settings.fyers_access_token or "").strip():
+        try:
+            saved_token = await asyncio.to_thread(state.fyers_auth.get_active_access_token)
+        except Exception as exc:
+            logger.warning("FYERS saved token bootstrap failed: %s", exc)
+            saved_token = ""
+        if saved_token:
+            _apply_fyers_access_token(state, saved_token, reason="startup saved access token")
     if state.settings.stream_mode == "fyers":
         asyncio.create_task(stream_loop(state))
         asyncio.create_task(option_chain_loop(state))
-        asyncio.create_task(fyers_refresh_loop(state))
         asyncio.create_task(paper_quote_loop(state))
         if state.paper_trade.enabled or state.live_execution.enabled:
             asyncio.create_task(sos_data_watchdog_loop(state))
@@ -6122,52 +5907,6 @@ async def user_subscription_razorpay_verify(
     }
 
 
-@app.get("/user/broker/angel-one/login-url")
-async def user_broker_angel_one_login_url(
-    request: Request,
-    authorization: Optional[str] = Header(default=None),
-) -> Dict[str, Any]:
-    state: AppState = app.state.state
-    user = _require_user(state, _authorization_from_request(authorization, request))
-    username = str(user.get("email") or user.get("username") or "").strip().lower()
-    try:
-        config = state.user_auth.get_user_broker_config(username)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-
-    client_id = str(config.get("client_id") or "").strip()
-    if not client_id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Set Angel One client id first.")
-
-    api_key = str(state.settings.angel_api_key or "").strip()
-    if not api_key:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="ANGEL_API_KEY is not configured.")
-
-    redirect_url = _resolve_angel_redirect_url(state.settings, request)
-    state_token = _build_angel_state(username=username, secret=state.settings.auth_secret, ttl_sec=900)
-    if not state_token:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create login state.")
-
-    publisher_base = str(state.settings.angel_publisher_login or "").strip()
-    if not publisher_base:
-        publisher_base = "https://smartapi.angelbroking.com/publisher-login/"
-
-    final_url = _append_query(
-        publisher_base,
-        {
-            "api_key": api_key,
-            "redirect_url": redirect_url,
-            "state": state_token,
-        },
-    )
-    return {
-        "ok": True,
-        "broker": "angel_one",
-        "auth_url": final_url,
-        "client_id": client_id,
-    }
-
-
 @app.get("/user/report/trades")
 async def user_report_trades(
     request: Request,
@@ -6492,105 +6231,6 @@ async def user_report_ai_trades(
     }
 
 
-@app.get("/auth/angel/callback")
-async def angel_callback(request: Request) -> Any:
-    state: AppState = app.state.state
-    parsed = _parse_angel_callback_query(request)
-    auth_token = str(parsed.get("auth_token") or "").strip()
-    refresh_token = str(parsed.get("refresh_token") or "").strip()
-    feed_token = str(parsed.get("feed_token") or "").strip()
-    state_token = str(parsed.get("state") or "").strip()
-    raw = parsed.get("raw") if isinstance(parsed.get("raw"), dict) else {}
-    redirect_base = "/ui"
-
-    if not auth_token or not refresh_token:
-        return RedirectResponse(url=f"{redirect_base}?angel=failed&reason=missing_tokens", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
-
-    username = _parse_angel_state(state_token, state.settings.auth_secret)
-
-    api_key = str(state.settings.angel_api_key or "").strip()
-    if not api_key:
-        return RedirectResponse(url=f"{redirect_base}?angel=failed&reason=missing_api_key", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
-
-    headers = {
-        "Authorization": f"Bearer {auth_token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "X-UserType": "USER",
-        "X-SourceID": "WEB",
-        "X-ClientLocalIP": str(state.settings.angel_client_local_ip or "127.0.0.1"),
-        "X-ClientPublicIP": str(state.settings.angel_client_public_ip or "0.0.0.0"),
-        "X-MACAddress": str(state.settings.angel_client_mac or "00:00:00:00:00:00"),
-        "X-PrivateKey": api_key,
-    }
-    payload = {"refreshToken": refresh_token}
-
-    try:
-        token_resp = await asyncio.to_thread(
-            requests.post,
-            "https://apiconnect.angelone.in/rest/auth/angelbroking/jwt/v1/generateTokens",
-            json=payload,
-            headers=headers,
-            timeout=15,
-        )
-        body = token_resp.json() if token_resp.content else {}
-    except Exception:
-        return RedirectResponse(url=f"{redirect_base}?angel=failed&reason=exchange_failed", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
-
-    if int(getattr(token_resp, "status_code", 500)) >= 400:
-        return RedirectResponse(url=f"{redirect_base}?angel=failed&reason=exchange_http", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
-
-    data = body.get("data") if isinstance(body, dict) else {}
-    access_token = str((data or {}).get("jwtToken") or "").strip()
-    new_feed_token = str((data or {}).get("feedToken") or feed_token).strip()
-    new_refresh_token = str((data or {}).get("refreshToken") or refresh_token).strip()
-    if not access_token:
-        return RedirectResponse(url=f"{redirect_base}?angel=failed&reason=no_access_token", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
-
-    decoded = _jwt_payload(access_token)
-    extracted_client_id = _extract_angel_client_id(decoded, raw)
-    if not extracted_client_id:
-        return RedirectResponse(url=f"{redirect_base}?angel=failed&reason=no_clientid", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
-
-    if not username:
-        username = state.user_auth.find_username_by_angel_client_id(extracted_client_id)
-    if not username:
-        return RedirectResponse(
-            url=f"{redirect_base}?angel=failed&reason=client_not_linked&clientId={extracted_client_id}",
-            status_code=status.HTTP_307_TEMPORARY_REDIRECT,
-        )
-
-    try:
-        cfg = state.user_auth.get_user_broker_config(username)
-    except ValueError:
-        return RedirectResponse(url=f"{redirect_base}?angel=failed&reason=user_not_found", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
-
-    expected_client_id = str(cfg.get("client_id") or "").strip()
-    if not expected_client_id:
-        return RedirectResponse(url=f"{redirect_base}?angel=failed&reason=client_not_set", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
-    if expected_client_id.lower() != extracted_client_id.lower():
-        return RedirectResponse(
-            url=f"{redirect_base}?angel=failed&reason=client_mismatch&clientId={extracted_client_id}",
-            status_code=status.HTTP_307_TEMPORARY_REDIRECT,
-        )
-
-    token_expires_at = _to_int(decoded.get("exp"), 0)
-    try:
-        state.user_auth.save_user_angel_session(
-            username=username,
-            client_id=extracted_client_id,
-            auth_token=auth_token,
-            access_token=access_token,
-            feed_token=new_feed_token,
-            refresh_token=new_refresh_token,
-            token_expires_at=token_expires_at,
-        )
-    except ValueError:
-        return RedirectResponse(url=f"{redirect_base}?angel=failed&reason=save_failed", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
-
-    return RedirectResponse(url=f"{redirect_base}?angel=connected", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
-
-
 @app.post("/auth/logout")
 async def auth_logout(
     request: Request,
@@ -6612,7 +6252,7 @@ async def fyers_status(
 ) -> Dict[str, Any]:
     state: AppState = app.state.state
     _require_admin(state, _authorization_from_request(authorization, request))
-    return state.fyers_auth.get_status()
+    return _fyers_status_payload(state)
 
 
 @app.get("/auth/fyers/url")
@@ -6650,24 +6290,5 @@ async def fyers_exchange(
     return {
         "ok": True,
         "access_token_expires_at": exchanged.get("access_token_expires_at", 0),
-        "refresh_token_expires_at": exchanged.get("refresh_token_expires_at", 0),
         "authenticated": bool(exchanged.get("authenticated", False)),
     }
-
-
-@app.post("/auth/fyers/refresh")
-async def fyers_refresh(
-    payload: FyersRefreshPayload,
-    request: Request,
-    authorization: Optional[str] = Header(default=None),
-) -> Dict[str, Any]:
-    state: AppState = app.state.state
-    _require_admin(state, _authorization_from_request(authorization, request))
-    try:
-        refreshed = await asyncio.to_thread(state.fyers_auth.refresh_access_token, force=bool(payload.force))
-        token = str(refreshed.get("access_token", "")).strip()
-        if token:
-            _apply_fyers_access_token(state, token, reason="manual refresh endpoint")
-    except RuntimeError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    return refreshed

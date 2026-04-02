@@ -31,7 +31,6 @@
   const paperResetBtn = document.getElementById("paper-reset-btn");
   const fyersStatusBtn = document.getElementById("fyers-status-btn");
   const fyersUrlBtn = document.getElementById("fyers-url-btn");
-  const fyersRefreshBtn = document.getElementById("fyers-refresh-btn");
   const fyersExchangeBtn = document.getElementById("fyers-exchange-btn");
   const fyersAuthCodeEl = document.getElementById("fyers-auth-code");
   const fyersStatusViewEl = document.getElementById("fyers-status-view");
@@ -39,7 +38,6 @@
   const hasFyersUi = Boolean(
     fyersStatusBtn ||
     fyersUrlBtn ||
-    fyersRefreshBtn ||
     fyersExchangeBtn ||
     fyersStatusViewEl ||
     fyersMsgEl
@@ -1890,32 +1888,6 @@
     }
   }
 
-  function applyAngelCallbackMessage() {
-    if (!hasBrokerUi()) {
-      return;
-    }
-    const params = new URLSearchParams(window.location.search || "");
-    const angel = String(params.get("angel") || "").trim().toLowerCase();
-    if (!angel) {
-      return;
-    }
-    const reason = String(params.get("reason") || "").trim();
-    if (angel === "connected") {
-      setText(brokerClientIdMsgEl, "Angel One terminal connected.");
-    } else if (angel === "failed") {
-      setText(
-        brokerClientIdMsgEl,
-        reason ? `Angel login failed: ${reason}` : "Angel login failed.",
-      );
-    }
-    params.delete("angel");
-    params.delete("reason");
-    params.delete("clientId");
-    const cleanQuery = params.toString();
-    const cleanUrl = `${window.location.pathname}${cleanQuery ? `?${cleanQuery}` : ""}${window.location.hash || ""}`;
-    window.history.replaceState({}, document.title, cleanUrl);
-  }
-
   function pushTimeline(snapshot) {
     if (!snapshot) {
       return;
@@ -2779,26 +2751,6 @@
     }
   }
 
-  async function onFyersRefresh() {
-    if (!hasFyersUi) {
-      return;
-    }
-    try {
-      const data = await requestJson("/auth/fyers/refresh", {
-        method: "POST",
-        data: { force: true },
-      });
-      if (data && data.refreshed) {
-        setText(fyersMsgEl, "Token refreshed.");
-      } else {
-        setText(fyersMsgEl, "Refresh skipped (not needed yet).");
-      }
-      await refreshFyersStatus();
-    } catch (err) {
-      setText(fyersMsgEl, `Refresh failed: ${err.message}`);
-    }
-  }
-
   async function refreshMarketChart(forceFull) {
     if (!hasChartUi) {
       return;
@@ -2856,11 +2808,10 @@
       const issues = Array.isArray(payload && payload.issues) ? payload.issues : [];
       const fyers = (payload && payload.fyers) || {};
       const accessLeft = formatReadyDuration(fyers.seconds_to_access_expiry || 0);
-      const refreshLeft = formatReadyDuration(fyers.seconds_to_refresh_expiry || 0);
       if (ready) {
         setText(readyStatusEl, "Ready: PASS");
         setPillState(readyStatusEl, "good");
-        setText(readySummaryEl, `All checks passed. Access ${accessLeft}, refresh ${refreshLeft}.`);
+        setText(readySummaryEl, `All checks passed. Access ${accessLeft}.`);
       } else if (issues.length) {
         setText(readyStatusEl, "Ready: ATTN");
         setPillState(readyStatusEl, "warn");
@@ -2938,9 +2889,6 @@
   }
   if (hasFyersUi && fyersExchangeBtn) {
     fyersExchangeBtn.addEventListener("click", onFyersExchange);
-  }
-  if (hasFyersUi && fyersRefreshBtn) {
-    fyersRefreshBtn.addEventListener("click", onFyersRefresh);
   }
   if (hasChartUi && tf1mBtn) {
     tf1mBtn.addEventListener("click", function () { onTfChange("1m"); });
@@ -3153,7 +3101,6 @@
     if (hasAdminLotUi()) {
       await refreshAdminLotSize();
     }
-    applyAngelCallbackMessage();
     if (hasChartUi) {
       setTfButtons();
       initChart();

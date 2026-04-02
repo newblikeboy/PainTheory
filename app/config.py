@@ -216,9 +216,6 @@ class Settings:
     auth_mysql_ssl_verify_cert: bool
     auth_mysql_ssl_verify_identity: bool
     angel_api_key: str
-    angel_publisher_login: str
-    angel_redirect_url: str
-    app_host: str
     angel_client_local_ip: str
     angel_client_public_ip: str
     angel_client_mac: str
@@ -240,8 +237,6 @@ class Settings:
     fyers_redirect_uri: str
     fyers_response_type: str
     fyers_scope: str
-    fyers_refresh_enabled: bool
-    fyers_refresh_check_sec: int
     fyers_refresh_lead_sec: int
     runtime_preload_enabled: bool
     runtime_preload_candles: int
@@ -368,12 +363,6 @@ def load_settings() -> Settings:
         auth_mysql_ssl_verify_cert=_get_bool("AUTH_MYSQL_SSL_VERIFY_CERT", False),
         auth_mysql_ssl_verify_identity=_get_bool("AUTH_MYSQL_SSL_VERIFY_IDENTITY", False),
         angel_api_key=_get_text("ANGEL_API_KEY", _get_text("API_KEY", "")),
-        angel_publisher_login=_get_text(
-            "ANGEL_PUBLISHER_LOGIN",
-            "https://smartapi.angelbroking.com/publisher-login/",
-        ),
-        angel_redirect_url=_get_text("ANGEL_REDIRECT_URL", ""),
-        app_host=_get_text("APP_HOST", "http://localhost:8000"),
         angel_client_local_ip=_get_text("CLIENT_LOCAL_IP", "127.0.0.1"),
         angel_client_public_ip=_get_text("CLIENT_PUBLIC_IP", "0.0.0.0"),
         angel_client_mac=_get_text("CLIENT_MAC", "00:00:00:00:00:00"),
@@ -395,8 +384,6 @@ def load_settings() -> Settings:
         fyers_redirect_uri=_get_text("FYERS_REDIRECT_URI", ""),
         fyers_response_type=_get_text("FYERS_RESPONSE_TYPE", "code"),
         fyers_scope=_get_text("FYERS_SCOPE", ""),
-        fyers_refresh_enabled=_get_bool("FYERS_REFRESH_ENABLED", True),
-        fyers_refresh_check_sec=_get_int("FYERS_REFRESH_CHECK_SEC", 30),
         fyers_refresh_lead_sec=_get_int("FYERS_REFRESH_LEAD_SEC", 300),
         runtime_preload_enabled=_get_bool("RUNTIME_PRELOAD_ENABLED", True),
         runtime_preload_candles=_get_int("RUNTIME_PRELOAD_CANDLES", 300),

@@ -174,15 +174,8 @@ def _fetch_resolution_rows(
             retries -= 1
 
             if auth_hint:
-                refreshed = manager.refresh_access_token(force=True)
-                token = str(refreshed.get("access_token") or "").strip()
-                if not token:
-                    raise RuntimeError("FYERS token refresh did not return access_token")
-                client = fyersModel.FyersModel(
-                    client_id=client_id,
-                    token=token,
-                    is_async=False,
-                    log_path="",
+                raise RuntimeError(
+                    f"[{resolution}] FYERS access token expired or is invalid. Re-authenticate and rerun the backfill."
                 )
 
             if retries <= 0:
@@ -253,16 +246,12 @@ def main() -> None:
         scope=settings.fyers_scope,
         refresh_lead_sec=settings.fyers_refresh_lead_sec,
     )
-    refreshed = manager.refresh_access_token(force=False)
-    access_token = str(refreshed.get("access_token") or "").strip()
+    access_token = manager.get_active_access_token()
     if not access_token:
         status = manager.get_status()
         if not bool(status.get("authenticated")):
-            raise RuntimeError("FYERS is not authenticated. Refresh/exchange token first.")
-        auth_data = Path(settings.fyers_auth_file).read_text(encoding="utf-8")
-        access_token = str(__import__("json").loads(auth_data).get("access_token") or "").strip()
-    if not access_token:
-        raise RuntimeError("Could not load FYERS access token.")
+            raise RuntimeError("FYERS is not authenticated. Exchange a fresh auth code first.")
+        raise RuntimeError("Could not load an active FYERS access token.")
     if not settings.fyers_client_id:
         raise RuntimeError("FYERS client_id is required.")
 
