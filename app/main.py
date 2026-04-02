@@ -4427,15 +4427,20 @@ async def sos_data_watchdog_loop(state: AppState) -> None:
                 continue
 
             trade_id = _to_int(paper_active.get("trade_id"), 0)
-            option_reference = 0
-            if (
-                trade_id > 0
-                and _to_int(state.last_option_quote_trade_id, 0) == trade_id
-                and _to_int(state.last_option_quote_received_at, 0) > 0
-            ):
-                option_reference = _to_int(state.last_option_quote_received_at, 0)
+            # Start stale-quote protection only after the first option LTP has
+            # actually been attached to this trade. Entry time alone is not a
+            # valid freshness baseline because the quote loop initializes
+            # option_entry_ltp asynchronously after the trade opens.
+            option_reference = _to_int(paper_active.get("option_quote_ts"), 0)
             if option_reference <= 0:
-                option_reference = max(int(state.startup_ts), paper_entry_ts)
+                if (
+                    trade_id > 0
+                    and _to_int(state.last_option_quote_trade_id, 0) == trade_id
+                    and _to_int(state.last_option_quote_received_at, 0) > 0
+                ):
+                    option_reference = _to_int(state.last_option_quote_received_at, 0)
+            if option_reference <= 0:
+                continue
             option_age = max(0, now_ts - option_reference)
             if (
                 option_age >= _SOS_DATA_STALE_SEC
