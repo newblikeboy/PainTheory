@@ -7,7 +7,7 @@ import json
 import re
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 import uuid
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -92,6 +92,7 @@ class PaperTradeEngine:
         mysql_mistakes_table: str = "paper_trade_mistakes",
         storage_backend: str = "mysql",
         model_driven_execution: bool = False,
+        quote_fetcher: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None,
     ) -> None:
         self.enabled = bool(enabled)
         self.symbol = str(symbol or "").strip()
@@ -111,6 +112,7 @@ class PaperTradeEngine:
         self.feedback_penalty_floor = max(0.35, min(0.95, float(feedback_penalty_floor)))
         self.feedback_reward_cap = max(1.0, min(1.5, float(feedback_reward_cap)))
         self.model_driven_execution = bool(model_driven_execution)
+        self._quote_fetcher = quote_fetcher
         backend = str(storage_backend or "mysql").strip().lower()
         if backend not in {"mysql", "memory"}:
             backend = "mysql"
@@ -166,6 +168,9 @@ class PaperTradeEngine:
         if not text or not re.fullmatch(r"[a-zA-Z0-9_]+", text):
             raise RuntimeError(f"{label} must contain only letters, numbers, and underscores")
         return text
+
+    def set_quote_fetcher(self, quote_fetcher: Optional[Callable[[str], Optional[Dict[str, Any]]]]) -> None:
+        self._quote_fetcher = quote_fetcher
 
     @staticmethod
     def _new_gate_stats() -> Dict[str, int]:
@@ -1656,6 +1661,15 @@ class PaperTradeEngine:
             reason = str(contract_reason or "missing_option_symbol")
             self._note_gate("option_contract_blocked", ts, reason)
             return False
+        entry_quote = self._resolve_entry_option_quote(
+            option_symbol=option_symbol,
+            selected_option=selected,
+        )
+        option_entry_ltp = _to_float(entry_quote.get("ltp"), 0.0)
+        option_quote_ts = _to_int(entry_quote.get("timestamp"), 0)
+        resolved_symbol = str(entry_quote.get("symbol") or "").strip()
+        if resolved_symbol:
+            option_symbol = resolved_symbol
         trade_id = len(self._trades) + (1 if self._active_trade else 0) + 1
         self._active_trade = {
             "trade_id": trade_id,
@@ -1679,13 +1693,48 @@ class PaperTradeEngine:
             "option_expiry_ts": _to_int(selected.get("expiry_ts"), 0),
             "option_expiry_kind": str(selected.get("expiry_kind") or "").strip().lower(),
             "option_contract_key": str(selected.get("contract_key") or "").strip(),
-            # Entry is locked to the first live option quote mark.
-            "option_entry_ltp": 0.0,
-            "option_mark_ltp": 0.0,
-            "option_quote_ts": 0,
+            # Entry is locked from the latest available option quote at trade-open time.
+            "option_entry_ltp": option_entry_ltp,
+            "option_mark_ltp": option_entry_ltp,
+            "option_quote_ts": option_quote_ts,
             "signal": dict(signal),
         }
         return True
+
+    def _resolve_entry_option_quote(
+        self,
+        *,
+        option_symbol: str,
+        selected_option: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        fetcher = self._quote_fetcher
+        text_symbol = str(option_symbol or "").strip()
+        if callable(fetcher) and text_symbol:
+            try:
+                quote = fetcher(text_symbol)
+            except Exception:
+                quote = None
+            if isinstance(quote, dict):
+                mark = _to_float(quote.get("ltp"), 0.0)
+                if mark > 0.0:
+                    return {
+                        "symbol": str(
+                            quote.get("resolved_symbol")
+                            or quote.get("symbol")
+                            or text_symbol
+                        ).strip(),
+                        "ltp": mark,
+                        "timestamp": _to_int(quote.get("timestamp"), 0),
+                    }
+
+        fallback_ltp = _to_float(selected_option.get("ltp_ref"), 0.0)
+        if fallback_ltp > 0.0:
+            return {
+                "symbol": text_symbol,
+                "ltp": fallback_ltp,
+                "timestamp": _to_int(selected_option.get("snapshot_ts"), 0),
+            }
+        return {}
 
     def _manage_open_trade(self, candle: Dict[str, Any], ai_state: Dict[str, Any]) -> bool:
         if self._active_trade is None:

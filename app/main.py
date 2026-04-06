@@ -1612,6 +1612,7 @@ class AppState:
                 )
             except Exception as exc:
                 logger.warning("FYERS quote client init skipped: %s", exc)
+        self.paper_trade.set_quote_fetcher(self.fetch_paper_trade_quote)
         self.retrainer = AutoRetrainService(
             settings=self.settings,
             runtime=self.pain_runtime,
@@ -1657,6 +1658,31 @@ class AppState:
             live_order_store=self.live_order_store,
             audit_store=self.angel_order_audit_store,
         )
+
+    def fetch_paper_trade_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
+        text_symbol = str(symbol or "").strip()
+        if not text_symbol:
+            return None
+
+        token = str(self.settings.fyers_access_token or "").strip()
+        client_id = str(self.settings.fyers_client_id or "").strip()
+        if not token or not client_id:
+            return None
+
+        if self.quote_client is None:
+            try:
+                self.quote_client = FyersQuoteClient(
+                    client_id=client_id,
+                    access_token=token,
+                    log_path=self.settings.fyers_log_path,
+                )
+            except Exception as exc:
+                logger.warning("FYERS quote client init failed during paper trade quote fetch: %s", exc)
+                return None
+        else:
+            self.quote_client.set_access_token(token)
+
+        return self.quote_client.fetch_ltp(text_symbol)
 
 
 class MySQLLiveOrderStore:
@@ -4237,14 +4263,6 @@ async def paper_quote_loop(state: AppState) -> None:
             if not token or not client_id:
                 await asyncio.sleep(sleep_sec)
                 continue
-            if state.quote_client is None:
-                state.quote_client = FyersQuoteClient(
-                    client_id=client_id,
-                    access_token=token,
-                    log_path=state.settings.fyers_log_path,
-                )
-            else:
-                state.quote_client.set_access_token(token)
 
             target = state.paper_trade.get_active_option_quote_target()
             if not target:
@@ -4254,8 +4272,7 @@ async def paper_quote_loop(state: AppState) -> None:
             if not symbol:
                 await asyncio.sleep(sleep_sec)
                 continue
-            fyers_symbol = symbol if symbol.upper().startswith("NSE:") else f"NSE:{symbol}"
-            quote = await asyncio.to_thread(state.quote_client.fetch_ltp, fyers_symbol)
+            quote = await asyncio.to_thread(state.fetch_paper_trade_quote, symbol)
             if quote:
                 quote_symbol = str(quote.get("symbol") or symbol).strip()
                 quote_ts = _to_int(quote.get("timestamp"), int(time.time()))
@@ -4331,10 +4348,9 @@ async def sos_data_watchdog_loop(state: AppState) -> None:
                 continue
 
             trade_id = _to_int(paper_active.get("trade_id"), 0)
-            # Start stale-quote protection only after the first option LTP has
-            # actually been attached to this trade. Entry time alone is not a
-            # valid freshness baseline because the quote loop initializes
-            # option_entry_ltp asynchronously after the trade opens.
+            # Start stale-quote protection only after the trade has a concrete
+            # option quote timestamp attached, either from the entry-time fetch
+            # or from the recurring quote loop.
             option_reference = _to_int(paper_active.get("option_quote_ts"), 0)
             if option_reference <= 0:
                 if (
