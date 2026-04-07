@@ -12,7 +12,7 @@ import time
 import uuid
 from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
@@ -48,6 +48,7 @@ except ZoneInfoNotFoundError:
 _NSE_OPEN_TIME = dt_time(9, 15)
 _NSE_CLOSE_TIME = dt_time(15, 30)
 _SOS_DATA_STALE_SEC = 60
+_QUOTE_SOURCE_MAX_AGE_SEC = 120
 _SOS_WATCHDOG_POLL_SEC = 5
 _SOS_RETRY_COOLDOWN_SEC = 15
 _SOS_UNDERLYING_CLOSE_REASON = "SOS Close - Unablt to Fet Underlying Value of Order Strike"
@@ -1509,11 +1510,8 @@ class AppState:
         self.current_5m: Optional[Dict[str, float]] = None
         self.last_tick: Optional[Dict[str, float]] = None
         self.last_underlying_data_received_at: int = 0
-        self.last_underlying_source_ts: int = 0
         self.last_option_signature: Optional[tuple[Any, ...]] = None
-        self.last_option_ts: int = 0
         self.last_option_quote_received_at: int = 0
-        self.last_option_quote_source_ts: int = 0
         self.last_option_quote_trade_id: int = 0
         self.last_sos_underlying_trigger_at: int = 0
         self.last_sos_option_trigger_at: int = 0
@@ -1657,6 +1655,7 @@ class AppState:
             user_auth=self.user_auth,
             live_order_store=self.live_order_store,
             audit_store=self.angel_order_audit_store,
+            paper_state_getter=self.paper_trade.get_state,
         )
 
     def fetch_paper_trade_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
@@ -2283,11 +2282,13 @@ class CentralizedAngelExecutionManager:
         user_auth: MySQLUserAuthStore,
         live_order_store: Optional["MySQLLiveOrderStore"] = None,
         audit_store: Optional["MySQLAngelOrderAuditStore"] = None,
+        paper_state_getter: Optional[Callable[[], Dict[str, Any]]] = None,
     ) -> None:
         self.settings = settings
         self.user_auth = user_auth
         self.live_order_store = live_order_store
         self.audit_store = audit_store
+        self.paper_state_getter = paper_state_getter
         self.enabled = bool(settings.central_live_execution_enabled)
         self.quantity = max(1, int(settings.central_live_execution_quantity))
         self.exchange = str(settings.central_live_execution_exchange or "NFO").strip().upper() or "NFO"
@@ -2397,6 +2398,28 @@ class CentralizedAngelExecutionManager:
             len(restored),
             latest_trade_id,
         )
+
+    def _get_paper_state_snapshot(self) -> Dict[str, Any]:
+        getter = self.paper_state_getter
+        if not callable(getter):
+            return {}
+        try:
+            state = getter()
+        except Exception as exc:
+            logger.warning("Live execution paper-state probe failed: %s", exc)
+            return {}
+        return state if isinstance(state, dict) else {}
+
+    @staticmethod
+    def _paper_trade_id_from_state(state: Dict[str, Any]) -> int:
+        active = state.get("active_trade") if isinstance(state.get("active_trade"), dict) else {}
+        return _to_int(active.get("trade_id"), 0)
+
+    def _is_trade_still_active(self, trade_id: int) -> tuple[bool, Dict[str, Any]]:
+        state = self._get_paper_state_snapshot()
+        if not state:
+            return True, {}
+        return self._paper_trade_id_from_state(state) == int(trade_id), state
 
     def _resolve_global_lot_size_qty(self) -> int:
         try:
@@ -2945,9 +2968,21 @@ class CentralizedAngelExecutionManager:
             self._spawn(self._dispatch_entry(dict(after_active)))
 
     async def _dispatch_entry(self, active_trade: Dict[str, Any]) -> None:
+        closed_during_dispatch = False
+        closed_trade: Dict[str, Any] = {}
         async with self._dispatch_lock:
             trade_id = _to_int(active_trade.get("trade_id"), 0)
             if trade_id <= 0:
+                return
+            trade_active, paper_state = self._is_trade_still_active(trade_id)
+            if not trade_active:
+                self._last_event = {
+                    "type": "entry",
+                    "ts": int(time.time()),
+                    "ok": False,
+                    "trade_id": trade_id,
+                    "message": "Skipped: paper trade already closed before live entry dispatch.",
+                }
                 return
             if self._active_positions and self._active_trade_id != trade_id:
                 self._last_event = {
@@ -3099,6 +3134,11 @@ class CentralizedAngelExecutionManager:
             placed: Dict[str, Dict[str, Any]] = {}
             failed = 0
             for session in eligible_sessions:
+                trade_active, paper_state = self._is_trade_still_active(trade_id)
+                if not trade_active:
+                    closed_during_dispatch = bool(placed)
+                    closed_trade = self._find_closed_trade(paper_state, trade_id)
+                    break
                 username = str(session.get("username") or "").strip().lower()
                 access_token = str(session.get("access_token") or "").strip()
                 api_key = str(session.get("api_key") or self.api_key or "").strip()
@@ -3159,8 +3199,13 @@ class CentralizedAngelExecutionManager:
                         )
                     except Exception as _exc:
                         logger.warning("live_order_store.save_entry failed for %s: %s", username, _exc)
+                trade_active, paper_state = self._is_trade_still_active(trade_id)
+                if not trade_active:
+                    closed_during_dispatch = True
+                    closed_trade = self._find_closed_trade(paper_state, trade_id)
+                    break
 
-            self._active_trade_id = trade_id
+            self._active_trade_id = trade_id if placed else 0
             self._active_positions = placed
             self._last_event = {
                 "type": "entry",
@@ -3175,6 +3220,12 @@ class CentralizedAngelExecutionManager:
                 "placed_users": len(placed),
                 "failed_users": int(failed),
             }
+            if closed_during_dispatch:
+                self._last_event["message"] = "Paper trade closed while live entry dispatch was in flight."
+        if closed_during_dispatch and self._active_positions:
+            if not isinstance(closed_trade, dict) or not closed_trade:
+                closed_trade = {"close_reason": "paper_trade_closed_during_live_entry_dispatch"}
+            await self._dispatch_exit(trade_id, closed_trade)
 
     async def _dispatch_exit(self, trade_id: int, closed_trade: Dict[str, Any]) -> None:
         async with self._dispatch_lock:
@@ -3375,6 +3426,20 @@ def _to_int(value: Any, default: int = 0) -> int:
         return int(float(value))
     except (TypeError, ValueError):
         return default
+
+
+def _effective_quote_timestamp(source_ts: Any, *, received_ts: int) -> int:
+    """Prefer source exchange timestamp when fresh, otherwise trust local receive time."""
+    recv = max(0, _to_int(received_ts, int(time.time())))
+    src = _to_int(source_ts, 0)
+    if src <= 0:
+        return recv
+    # Guard against stale or future-skewed source timestamps.
+    if src > recv + _SOS_DATA_STALE_SEC:
+        return recv
+    if recv - src > _QUOTE_SOURCE_MAX_AGE_SEC:
+        return recv
+    return src
 
 
 def _validate_identifier(value: str, label: str) -> str:
@@ -4093,7 +4158,6 @@ async def process_tick(state: AppState, tick: Dict[str, float]) -> None:
         )
         return
     state.last_underlying_data_received_at = now_ts
-    state.last_underlying_source_ts = ts
     state.last_tick = {
         "timestamp": ts,
         "price": price,
@@ -4228,7 +4292,6 @@ async def option_chain_loop(state: AppState) -> None:
                     await asyncio.to_thread(state.option_strike_store.persist_batch, [snapshot])
                     state.pain_runtime.ingest(candles=[], candles_5m=[], option_snapshots=[snapshot])
                     state.last_option_signature = signature
-                    state.last_option_ts = snapshot_ts
 
             await poller.run(
                 on_option,
@@ -4275,10 +4338,14 @@ async def paper_quote_loop(state: AppState) -> None:
             quote = await asyncio.to_thread(state.fetch_paper_trade_quote, symbol)
             if quote:
                 quote_symbol = str(quote.get("symbol") or symbol).strip()
-                quote_ts = _to_int(quote.get("timestamp"), int(time.time()))
+                received_ts = int(time.time())
+                quote_source_ts = _to_int(quote.get("timestamp"), 0)
+                quote_ts = _effective_quote_timestamp(
+                    quote_source_ts,
+                    received_ts=received_ts,
+                )
                 if quote_symbol.upper() == symbol.upper():
-                    state.last_option_quote_received_at = int(time.time())
-                    state.last_option_quote_source_ts = quote_ts
+                    state.last_option_quote_received_at = received_ts
                     state.last_option_quote_trade_id = _to_int(target.get("trade_id"), 0)
                 state.paper_trade.update_option_mark(
                     symbol=quote_symbol,
@@ -4352,13 +4419,14 @@ async def sos_data_watchdog_loop(state: AppState) -> None:
             # option quote timestamp attached, either from the entry-time fetch
             # or from the recurring quote loop.
             option_reference = _to_int(paper_active.get("option_quote_ts"), 0)
-            if option_reference <= 0:
-                if (
-                    trade_id > 0
-                    and _to_int(state.last_option_quote_trade_id, 0) == trade_id
-                    and _to_int(state.last_option_quote_received_at, 0) > 0
-                ):
-                    option_reference = _to_int(state.last_option_quote_received_at, 0)
+            if (
+                trade_id > 0
+                and _to_int(state.last_option_quote_trade_id, 0) == trade_id
+            ):
+                option_reference = max(
+                    option_reference,
+                    _to_int(state.last_option_quote_received_at, 0),
+                )
             if option_reference <= 0:
                 continue
             option_age = max(0, now_ts - option_reference)

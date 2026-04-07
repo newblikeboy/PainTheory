@@ -53,6 +53,21 @@ _MISTAKE_ORDER = (
     "chop_zone",
     "expiry_noise",
 )
+_QUOTE_SOURCE_MAX_AGE_SEC = 120
+_QUOTE_SOURCE_FUTURE_SLACK_SEC = 60
+
+
+def _effective_quote_timestamp(source_ts: Any, *, received_ts: int) -> int:
+    """Prefer source exchange timestamp when fresh; otherwise use receive time."""
+    recv = max(0, _to_int(received_ts, int(time.time())))
+    src = _to_int(source_ts, 0)
+    if src <= 0:
+        return recv
+    if src > recv + _QUOTE_SOURCE_FUTURE_SLACK_SEC:
+        return recv
+    if recv - src > _QUOTE_SOURCE_MAX_AGE_SEC:
+        return recv
+    return src
 
 
 class PaperTradeEngine:
@@ -1643,6 +1658,18 @@ class PaperTradeEngine:
             origin_high=origin_high,
             ai_state=ai_state if isinstance(ai_state, dict) else {},
         )
+        candle_ts = _to_int(ts, 0)
+        now_ts = int(time.time())
+        # Use runtime wall-clock for near-real-time execution timestamps so
+        # paper/live latency reflects actual processing time. For historical
+        # replay (e.g. backtest), preserve candle-time semantics.
+        if candle_ts > 0 and abs(now_ts - candle_ts) <= 300:
+            entry_ts = now_ts
+        elif candle_ts > 0:
+            entry_ts = candle_ts
+        else:
+            entry_ts = max(1, now_ts)
+            candle_ts = entry_ts
         selected = signal.get("selected_option") if isinstance(signal.get("selected_option"), dict) else {}
         option_symbol = str(selected.get("symbol") or "").strip()
         option_token = str(
@@ -1654,12 +1681,12 @@ class PaperTradeEngine:
         option_exchange = str(selected.get("exchange") or "").strip().upper()
         contract_tradeable, contract_reason = contract_tradeability(
             selected,
-            reference_ts=ts,
+            reference_ts=candle_ts,
             allow_expiry_day=True,
         )
         if not option_symbol or not contract_tradeable:
             reason = str(contract_reason or "missing_option_symbol")
-            self._note_gate("option_contract_blocked", ts, reason)
+            self._note_gate("option_contract_blocked", entry_ts, reason)
             return False
         entry_quote = self._resolve_entry_option_quote(
             option_symbol=option_symbol,
@@ -1676,9 +1703,10 @@ class PaperTradeEngine:
             "symbol": self.symbol,
             "status": "open",
             "direction": direction,
-            "entry_ts": ts,
+            "entry_ts": entry_ts,
+            "signal_ts": candle_ts,
             "entry_price": close_price,
-            "planned_exit_ts": ts + self.hold_seconds,
+            "planned_exit_ts": entry_ts + self.hold_seconds,
             "hold_seconds": self.hold_seconds,
             "stop_loss": levels["stop_loss"],
             "target_price": levels["target_price"],
@@ -1717,6 +1745,10 @@ class PaperTradeEngine:
             if isinstance(quote, dict):
                 mark = _to_float(quote.get("ltp"), 0.0)
                 if mark > 0.0:
+                    quote_ts = _effective_quote_timestamp(
+                        quote.get("timestamp"),
+                        received_ts=int(time.time()),
+                    )
                     return {
                         "symbol": str(
                             quote.get("resolved_symbol")
@@ -1724,7 +1756,7 @@ class PaperTradeEngine:
                             or text_symbol
                         ).strip(),
                         "ltp": mark,
-                        "timestamp": _to_int(quote.get("timestamp"), 0),
+                        "timestamp": quote_ts,
                     }
 
         fallback_ltp = _to_float(selected_option.get("ltp_ref"), 0.0)
@@ -2479,7 +2511,8 @@ class PaperTradeEngine:
                 active["option_mark_ltp"] = mark
                 changed = True
             qts = _to_int(quote_ts, int(time.time()))
-            if qts > 0 and _to_int(active.get("option_quote_ts"), 0) != qts:
+            prev_qts = _to_int(active.get("option_quote_ts"), 0)
+            if qts > 0 and qts > prev_qts:
                 active["option_quote_ts"] = qts
                 changed = True
             if changed:
