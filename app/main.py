@@ -2474,24 +2474,45 @@ class CentralizedAngelExecutionManager:
         return bool(re.fullmatch(r"[A-Z]+\d{2}(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\d{2}\d+(CE|PE)", text))
 
     @classmethod
+    def _parts_from_option_contract(cls, contract: Dict[str, Any]) -> Dict[str, str]:
+        if not isinstance(contract, dict):
+            return {}
+        strike = _to_float(contract.get("strike"), 0.0)
+        strike_text = str(int(round(strike))) if strike > 0.0 and abs(strike - round(strike)) < 1e-6 else str(strike or "")
+        month_name = str(contract.get("expiry_month_name") or "").strip().upper()
+        year_short = str(contract.get("expiry_year_short") or "").strip().zfill(2) if contract.get("expiry_year_short") else ""
+        day = str(contract.get("expiry_day") or "").strip().zfill(2) if _to_int(contract.get("expiry_day"), 0) > 0 else ""
+        expiry_date = str(contract.get("expiry_date") or "").strip()
+        if expiry_date:
+            try:
+                expiry_dt = datetime.strptime(expiry_date, "%Y-%m-%d")
+            except ValueError:
+                expiry_dt = None
+            if expiry_dt is not None:
+                if not day:
+                    day = f"{expiry_dt.day:02d}"
+                if not month_name and 1 <= expiry_dt.month <= 12:
+                    month_name = calendar.month_abbr[expiry_dt.month].upper()
+                if not year_short:
+                    year_short = str(expiry_dt.year)[-2:]
+        return {
+            "underlying": str(contract.get("underlying") or "").strip().upper(),
+            "day": day,
+            "month": month_name,
+            "year": year_short,
+            "strike": strike_text,
+            "side": str(contract.get("option_type") or "").strip().upper(),
+            "expiry_kind": str(contract.get("expiry_kind") or "").strip().lower(),
+            "expiry_date": expiry_date,
+        }
+
+    @classmethod
     def _parse_option_symbol_parts(cls, value: Any) -> Dict[str, str]:
         contract = extract_option_contract(value)
         text = cls._normalize_option_trading_symbol(contract.get("symbol"))
         if not text:
             return {}
-        strike = _to_float(contract.get("strike"), 0.0)
-        strike_text = str(int(round(strike))) if strike > 0.0 and abs(strike - round(strike)) < 1e-6 else str(strike or "")
-        month_name = str(contract.get("expiry_month_name") or "").strip().upper()
-        return {
-            "underlying": str(contract.get("underlying") or "").strip().upper(),
-            "day": str(contract.get("expiry_day") or "").strip().zfill(2) if _to_int(contract.get("expiry_day"), 0) > 0 else "",
-            "month": month_name,
-            "year": str(contract.get("expiry_year_short") or "").strip().zfill(2) if contract.get("expiry_year_short") else "",
-            "strike": strike_text,
-            "side": str(contract.get("option_type") or "").strip().upper(),
-            "expiry_kind": str(contract.get("expiry_kind") or "").strip().lower(),
-            "expiry_date": str(contract.get("expiry_date") or "").strip(),
-        }
+        return cls._parts_from_option_contract(contract)
 
     @classmethod
     def _build_angel_symbol_from_parts(cls, parts: Dict[str, str]) -> str:
@@ -2704,7 +2725,16 @@ class CentralizedAngelExecutionManager:
         )
         candidates = build_symbol_search_candidates(target_contract)
         target_keys = [self._symbol_match_key(item) for item in candidates if item]
-        target_parts = self._parse_option_symbol_parts(target_contract.get("symbol") or target_symbol)
+        # Monthly symbols like NIFTY26APR24250CE are ambiguous when parsed from
+        # text alone; derive matching parts from contract metadata so Angel's
+        # DDMONYY monthly symbol can still be matched.
+        target_parts = self._parts_from_option_contract(target_contract)
+        if str(target_parts.get("expiry_kind") or "").strip().lower() != "monthly":
+            legacy_parts = self._parse_option_symbol_parts(target_contract.get("symbol") or target_symbol)
+            if legacy_parts:
+                target_parts = legacy_parts
+        if not target_parts:
+            target_parts = self._parse_option_symbol_parts(target_contract.get("symbol") or target_symbol)
         best: Dict[str, str] = {}
         best_score = -1
 
