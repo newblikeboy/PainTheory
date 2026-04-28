@@ -840,6 +840,7 @@ class BacktestEngine:
             mysql_trades_table=self.settings.paper_trade_mysql_trades_table,
             mysql_feedback_table=self.settings.paper_trade_mysql_feedback_table,
             mysql_mistakes_table=self.settings.paper_trade_mysql_mistakes_table,
+            option_upnl_exit_points=float(self.settings.paper_trade_option_upnl_exit_points),
             storage_backend="memory",
             model_driven_execution=True,
         )

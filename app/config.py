@@ -277,6 +277,7 @@ class Settings:
     paper_trade_feedback_block_win_rate: float
     paper_trade_feedback_penalty_floor: float
     paper_trade_feedback_reward_cap: float
+    paper_trade_option_upnl_exit_points: float
     paper_trade_mysql_state_table: str
     paper_trade_mysql_trades_table: str
     paper_trade_mysql_feedback_table: str
@@ -438,6 +439,10 @@ def load_settings() -> Settings:
         paper_trade_feedback_reward_cap=max(
             1.0,
             min(1.5, _get_float("PAPER_TRADE_FEEDBACK_REWARD_CAP", 1.12)),
+        ),
+        paper_trade_option_upnl_exit_points=max(
+            0.0,
+            _get_float("PAPER_TRADE_OPTION_UPNL_EXIT_POINTS", 25.0),
         ),
         paper_trade_mysql_state_table=_get_text("PAPER_TRADE_MYSQL_STATE_TABLE", "paper_trade_state"),
         paper_trade_mysql_trades_table=_get_text("PAPER_TRADE_MYSQL_TRADES_TABLE", "paper_trade_trades"),

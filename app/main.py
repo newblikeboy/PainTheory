@@ -1594,6 +1594,7 @@ class AppState:
             mysql_feedback_table=self.settings.paper_trade_mysql_feedback_table,
             mysql_mistakes_table=self.settings.paper_trade_mysql_mistakes_table,
             model_driven_execution=True,
+            option_upnl_exit_points=self.settings.paper_trade_option_upnl_exit_points,
         )
         self.quote_client: Optional[FyersQuoteClient] = None
         self.fyers_token_generation: int = 0
@@ -4377,11 +4378,15 @@ async def paper_quote_loop(state: AppState) -> None:
                 if quote_symbol.upper() == symbol.upper():
                     state.last_option_quote_received_at = received_ts
                     state.last_option_quote_trade_id = _to_int(target.get("trade_id"), 0)
-                state.paper_trade.update_option_mark(
+                before_quote_state = state.paper_trade.get_state() if state.live_execution.enabled else {}
+                quote_updated = state.paper_trade.update_option_mark(
                     symbol=quote_symbol,
                     ltp=_to_float(quote.get("ltp")),
                     quote_ts=quote_ts,
                 )
+                if quote_updated and before_quote_state:
+                    after_quote_state = state.paper_trade.get_state()
+                    state.live_execution.observe_transition(before_quote_state, after_quote_state)
         except Exception as exc:
             logger.exception("Paper quote loop error: %s", exc)
             if _is_fyers_auth_error(exc):

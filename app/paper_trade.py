@@ -107,6 +107,7 @@ class PaperTradeEngine:
         mysql_mistakes_table: str = "paper_trade_mistakes",
         storage_backend: str = "mysql",
         model_driven_execution: bool = False,
+        option_upnl_exit_points: float = 25.0,
         quote_fetcher: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None,
     ) -> None:
         self.enabled = bool(enabled)
@@ -127,6 +128,7 @@ class PaperTradeEngine:
         self.feedback_penalty_floor = max(0.35, min(0.95, float(feedback_penalty_floor)))
         self.feedback_reward_cap = max(1.0, min(1.5, float(feedback_reward_cap)))
         self.model_driven_execution = bool(model_driven_execution)
+        self.option_upnl_exit_points = max(0.0, float(option_upnl_exit_points))
         self._quote_fetcher = quote_fetcher
         backend = str(storage_backend or "mysql").strip().lower()
         if backend not in {"mysql", "memory"}:
@@ -2221,6 +2223,7 @@ class PaperTradeEngine:
             "avoid_noon_chop": self.avoid_noon_chop,
             "feedback_enabled": self.feedback_enabled,
             "feedback_min_trades": self.feedback_min_trades,
+            "option_upnl_exit_points": self.option_upnl_exit_points,
             "feedback_setups": len(self._feedback_stats),
             "feedback_last_decision": dict(self._last_feedback_decision),
             "last_candle_ts": self._last_candle_ts,
@@ -2514,6 +2517,24 @@ class PaperTradeEngine:
             prev_qts = _to_int(active.get("option_quote_ts"), 0)
             if qts > 0 and qts > prev_qts:
                 active["option_quote_ts"] = qts
+                changed = True
+            target_points = max(0.0, _to_float(self.option_upnl_exit_points, 0.0))
+            option_entry = _to_float(active.get("option_entry_ltp"), 0.0)
+            option_mark = _to_float(active.get("option_mark_ltp"), 0.0)
+            if (
+                target_points > 0.0
+                and option_entry > 0.0
+                and option_mark > 0.0
+                and (option_mark - option_entry) >= target_points
+            ):
+                exit_underlying = _to_float(self._last_price, 0.0)
+                if exit_underlying <= 0.0:
+                    exit_underlying = _to_float(active.get("entry_price"), 0.0)
+                self._close_active_trade(
+                    exit_ts=qts if qts > 0 else int(time.time()),
+                    exit_price=exit_underlying,
+                    reason="option_upnl_target_hit",
+                )
                 changed = True
             if changed:
                 self._persist()
