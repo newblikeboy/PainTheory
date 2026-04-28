@@ -61,6 +61,28 @@ def _clamp(value: float, low: float, high: float) -> float:
     return value
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float, *, low: float = 0.0, high: float = 1.0) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return _clamp(float(default), low, high)
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = float(default)
+    return _clamp(parsed, low, high)
+
+
+_ENTRY_TRIGGER_STRICT_GATE = _env_bool("ENTRY_TRIGGER_STRICT_GATE", True)
+_ENTRY_TRIGGER_MIN_CONF = _env_float("ENTRY_TRIGGER_MIN_CONF", 0.75, low=0.0, high=1.0)
+
+
 def load_pain_theory_model(path: str) -> Optional[PainTheoryModelBundle]:
     if not path or not os.path.exists(path):
         return None
@@ -267,29 +289,24 @@ def predict_pain_theory(
     derived_entry_signal = bool(trade_plan["entry_signal"])
     entry_signal = bool(derived_entry_signal)
     entry_trigger_conf = 0.5
-    if "entry_trigger" in model.classifiers and "entry_trigger" in model.encoders:
+    has_entry_trigger_model = bool("entry_trigger" in model.classifiers and "entry_trigger" in model.encoders)
+    predicted_entry = False
+    if has_entry_trigger_model:
         trigger_idx, trigger_conf = _predict_target(model.classifiers["entry_trigger"], vector)
         trigger_label = str(model.encoders["entry_trigger"].inverse_transform([trigger_idx])[0])
-        predicted_entry = _entry_label_to_bool(trigger_label)
+        predicted_entry = bool(_entry_label_to_bool(trigger_label))
+        entry_trigger_conf = float(trigger_conf)
+    entry_trigger_conf = _clamp(entry_trigger_conf, 0.0, 1.0)
+    if has_entry_trigger_model and _ENTRY_TRIGGER_STRICT_GATE:
+        entry_signal = bool(predicted_entry and entry_trigger_conf >= _ENTRY_TRIGGER_MIN_CONF)
+    elif has_entry_trigger_model:
         if predicted_entry:
             entry_signal = True
         elif not derived_entry_signal:
             entry_signal = False
         else:
             # Treat low-confidence negatives as advisory, not hard veto.
-            entry_signal = bool(trigger_conf < 0.80)
-        entry_trigger_conf = float(trigger_conf)
-        overlay = overlay_out.get("overlay") if isinstance(overlay_out.get("overlay"), dict) else {}
-        if (
-            not entry_signal
-            and bool(overlay.get("usable", False))
-            and confidence >= 0.60
-            and guidance in {"caution"}
-            and _is_directional_next_group(str(next_group))
-            and float(overlay.get("strength", 0.0)) >= 0.35
-        ):
-            entry_signal = True
-    entry_trigger_conf = _clamp(entry_trigger_conf, 0.0, 1.0)
+            entry_signal = bool(entry_trigger_conf < 0.80)
 
     mistake_type = "none"
     mistake_conf = 0.0
