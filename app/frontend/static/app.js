@@ -123,6 +123,7 @@
   const brokerClientIdSaveBtn = document.getElementById("broker-client-id-save-btn");
   const brokerClientIdMsgEl = document.getElementById("broker-client-id-msg");
   const terminalLoginToggleEl = document.getElementById("terminal-login-toggle");
+  const angelTokenGeneratedMsgEl = document.getElementById("angel-token-generated-msg");
   const tradingEngineToggleEl = document.getElementById("trading-engine-toggle");
   const tradingEngineMsgEl = document.getElementById("trading-engine-msg");
   const subscribePlanSelectEl = document.getElementById("subscribe-plan-select");
@@ -363,6 +364,42 @@
       terminalLoginToggleEl.classList.toggle("is-off", !isConnected);
       terminalLoginToggleEl.setAttribute("aria-checked", isConnected ? "true" : "false");
     }
+  }
+
+  function formatAngelTokenGeneratedAt(tsSeconds) {
+    const ts = Math.floor(safeNum(tsSeconds, 0));
+    if (ts <= 0) {
+      return "--";
+    }
+    const parts = new Intl.DateTimeFormat("en-IN", {
+      timeZone: IST_TZ,
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: true,
+    }).formatToParts(new Date(ts * 1000));
+    const map = {};
+    parts.forEach(function (part) {
+      if (part.type !== "literal") {
+        map[part.type] = part.value;
+      }
+    });
+    const day = map.day || "01";
+    const month = map.month || "Jan";
+    const year = map.year || "1970";
+    const hour = map.hour || "12";
+    const minute = map.minute || "00";
+    const period = String(map.dayPeriod || "").toUpperCase() || "AM";
+    return `${day}/${month}/${year} ${hour}:${minute} ${period}`;
+  }
+
+  function setAngelTokenGeneratedAt(tsSeconds) {
+    if (!angelTokenGeneratedMsgEl) {
+      return;
+    }
+    angelTokenGeneratedMsgEl.textContent = `New token is generated on ${formatAngelTokenGeneratedAt(tsSeconds)}`;
   }
 
   function setTradingEngineEnabled(enabled) {
@@ -1515,6 +1552,7 @@
       const engineEnabled = Boolean(config.trading_engine_enabled || config.enabled);
       setSubscriptionStatusFromData(config);
       setLotConfigFromData({ user_lot_count: config.user_lot_count });
+      setAngelTokenGeneratedAt(config.exchanged_at);
       setText(brokerClientIdValueEl, clientId || "Not set");
       setText(brokerApiKeyValueEl, apiKeySaved ? (apiKeyHint || "Saved") : "Not saved");
       setText(brokerPinValueEl, pinSaved ? "Saved" : "Not saved");
@@ -1816,6 +1854,7 @@
       });
       const config = payload && typeof payload.config === "object" ? payload.config : {};
       const saved = String(config.client_id || "").trim();
+      setAngelTokenGeneratedAt(config.exchanged_at);
       setText(brokerClientIdValueEl, saved || "Not set");
       setText(brokerApiKeyValueEl, config.api_key_saved ? String(config.api_key_hint || "Saved") : "Not saved");
       setText(brokerPinValueEl, config.pin_saved ? "Saved" : "Not saved");
@@ -1863,6 +1902,7 @@
         });
         const config = payload && typeof payload.config === "object" ? payload.config : {};
         setTerminalLoginConnected(Boolean(config.connected));
+        setAngelTokenGeneratedAt(config.exchanged_at);
         setTradingEngineEnabled(tradingEngineEnabled);
         setText(brokerClientIdMsgEl, "Terminal login switched off.");
         return;
@@ -1878,6 +1918,7 @@
       });
       const config = payload && typeof payload.config === "object" ? payload.config : {};
       setTerminalLoginConnected(Boolean(config.connected));
+      setAngelTokenGeneratedAt(config.exchanged_at);
       setTradingEngineEnabled(tradingEngineEnabled);
       setText(brokerClientIdMsgEl, "Angel One terminal connected.");
     } catch (err) {

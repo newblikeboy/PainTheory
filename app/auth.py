@@ -10,8 +10,10 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qs, urlparse
 
 from fyers_apiv3 import fyersModel
+import requests
 
 from .config import mysql_connect_kwargs_from_parts
 
@@ -1650,6 +1652,63 @@ class MySQLUserAuthStore(UserAuthStore):
                 if conn is not None:
                     conn.close()
 
+    def list_connected_angel_login_sessions(self, limit: int = 5000) -> List[Dict[str, Any]]:
+        max_rows = max(1, min(int(limit), 20000))
+        conn = None
+        cur = None
+        with self._lock:
+            try:
+                conn = self._connect(with_database=True)
+                cur = conn.cursor(dictionary=True)
+                cur.execute(
+                    """
+                    SELECT
+                        email,
+                        angel_one_client_id,
+                        angel_one_api_key,
+                        angel_one_pin,
+                        angel_one_totp_secret,
+                        angel_one_connected,
+                        angel_one_token_expires_at,
+                        angel_one_exchanged_at
+                    FROM auth_users
+                    WHERE angel_one_connected = 1
+                      AND angel_one_client_id IS NOT NULL
+                      AND angel_one_client_id <> ''
+                      AND angel_one_pin IS NOT NULL
+                      AND angel_one_pin <> ''
+                      AND angel_one_totp_secret IS NOT NULL
+                      AND angel_one_totp_secret <> ''
+                    ORDER BY email ASC
+                    LIMIT %s
+                    """,
+                    (max_rows,),
+                )
+                rows = cur.fetchall() or []
+                conn.commit()
+                out: List[Dict[str, Any]] = []
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    out.append(
+                        {
+                            "username": self._to_row_value(row, "email"),
+                            "client_id": self._to_row_value(row, "angel_one_client_id"),
+                            "api_key": self._to_row_value(row, "angel_one_api_key"),
+                            "pin": self._to_row_value(row, "angel_one_pin"),
+                            "totp_secret": self._to_row_value(row, "angel_one_totp_secret"),
+                            "connected": _to_int(row.get("angel_one_connected"), 0) > 0,
+                            "token_expires_at": _to_int(row.get("angel_one_token_expires_at"), 0),
+                            "exchanged_at": _to_int(row.get("angel_one_exchanged_at"), 0),
+                        }
+                    )
+                return out
+            finally:
+                if cur is not None:
+                    cur.close()
+                if conn is not None:
+                    conn.close()
+
     def logout(self, authorization: str) -> bool:
         token = self._extract_token(authorization)
         if not token:
@@ -1687,6 +1746,9 @@ class FyersAuthManager:
         secret_key: str,
         pin: str,
         redirect_uri: str,
+        user_id: str = "",
+        totp_key: str = "",
+        login_app_id: str = "2",
         response_type: str = "code",
         scope: str = "",
         refresh_lead_sec: int = 300,
@@ -1695,6 +1757,9 @@ class FyersAuthManager:
         self.client_id = str(client_id or "").strip()
         self.secret_key = str(secret_key or "").strip()
         self.pin = str(pin or "").strip()
+        self.user_id = str(user_id or "").strip()
+        self.totp_key = str(totp_key or "").strip()
+        self.login_app_id = str(login_app_id or "2").strip() or "2"
         self.redirect_uri = str(redirect_uri or "").strip()
         self.response_type = str(response_type or "code").strip()
         self.scope = str(scope or "").strip()
@@ -1727,6 +1792,16 @@ class FyersAuthManager:
 
     def _app_id_hash(self) -> str:
         return hashlib.sha256(f"{self.client_id}:{self.secret_key}".encode("utf-8")).hexdigest()
+
+    def is_totp_configured(self) -> bool:
+        return bool(
+            self.client_id
+            and self.secret_key
+            and self.redirect_uri
+            and self.user_id
+            and self.pin
+            and self.totp_key
+        )
 
     def _persist_tokens(self, raw: Dict[str, Any], previous: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         previous = previous or {}
@@ -1777,6 +1852,7 @@ class FyersAuthManager:
                 "seconds_to_refresh_expiry": max(0, refresh_exp - now) if refresh_exp else 0,
                 "needs_refresh": bool(has_refresh_token and access_exp and access_exp <= now + self.refresh_lead_sec),
                 "refresh_valid": refresh_valid,
+                "totp_configured": self.is_totp_configured(),
             }
 
     def get_active_access_token(self) -> str:
@@ -1814,5 +1890,148 @@ class FyersAuthManager:
             saved["authenticated"] = True
             return saved
 
+    def refresh_access_token_with_totp(self) -> Dict[str, Any]:
+        with self._lock:
+            missing = [
+                name
+                for name, value in {
+                    "FYERS_CLIENT_ID": self.client_id,
+                    "FYERS_SECRET_KEY": self.secret_key,
+                    "FYERS_REDIRECT_URI": self.redirect_uri,
+                    "FYERS_USER_ID": self.user_id,
+                    "FYERS_PIN": self.pin,
+                    "FYERS_TOTP_KEY": self.totp_key,
+                }.items()
+                if not value
+            ]
+            if missing:
+                raise RuntimeError(f"Missing FYERS TOTP configuration: {', '.join(missing)}")
+
+            try:
+                import pyotp
+            except ImportError as exc:
+                raise RuntimeError("Install pyotp to use FYERS TOTP automation") from exc
+
+            app_id, app_type = self._split_client_id(self.client_id)
+            request_key = self._fyers_post_json(
+                "https://api-t2.fyers.in/vagator/v2/send_login_otp",
+                {"fy_id": self.user_id, "app_id": self.login_app_id},
+                "FYERS send_login_otp",
+            ).get("request_key")
+            if not request_key:
+                raise RuntimeError("FYERS send_login_otp did not return request_key")
+
+            request_key = self._fyers_post_json(
+                "https://api-t2.fyers.in/vagator/v2/verify_otp",
+                {"request_key": request_key, "otp": pyotp.TOTP(self.totp_key).now()},
+                "FYERS verify_otp",
+            ).get("request_key")
+            if not request_key:
+                raise RuntimeError("FYERS verify_otp did not return request_key")
+
+            pin_response = self._fyers_post_json(
+                "https://api-t2.fyers.in/vagator/v2/verify_pin",
+                {"request_key": request_key, "identity_type": "pin", "identifier": self.pin},
+                "FYERS verify_pin",
+            )
+            login_access_token = self._find_access_token(pin_response)
+            if not login_access_token:
+                raise RuntimeError("FYERS verify_pin did not return login access token")
+
+            auth_code_response = self._fyers_post_json(
+                "https://api-t1.fyers.in/api/v3/token",
+                {
+                    "fyers_id": self.user_id,
+                    "app_id": app_id,
+                    "redirect_uri": self.redirect_uri,
+                    "appType": app_type,
+                    "code_challenge": "",
+                    "state": "pain-theory-ai",
+                    "scope": self.scope,
+                    "nonce": "",
+                    "response_type": self.response_type,
+                    "create_cookie": True,
+                },
+                "FYERS token",
+                headers={"Authorization": f"Bearer {login_access_token}"},
+                allowed_statuses={200, 308},
+                allow_redirects=False,
+            )
+            auth_code = self._extract_auth_code(auth_code_response)
+            if not auth_code:
+                raise RuntimeError(f"FYERS token did not return auth_code: {auth_code_response}")
+
+            token_response = self._fyers_post_json(
+                "https://api-t1.fyers.in/api/v3/validate-authcode",
+                {
+                    "grant_type": "authorization_code",
+                    "appIdHash": self._app_id_hash(),
+                    "code": auth_code,
+                },
+                "FYERS validate-authcode",
+            )
+            previous = self._read_auth()
+            saved = self._persist_tokens(token_response, previous=previous)
+            saved["authenticated"] = True
+            return saved
+
     def refresh_access_token(self, force: bool = False) -> Dict[str, Any]:
         raise RuntimeError("FYERS refresh-token flow has been removed. Re-authenticate with a new auth code.")
+
+    @staticmethod
+    def _split_client_id(client_id: str) -> tuple[str, str]:
+        if "-" not in client_id:
+            raise RuntimeError("FYERS_CLIENT_ID must be in APP_ID-APP_TYPE format, for example ABCD1234-100")
+        app_id, app_type = client_id.rsplit("-", 1)
+        if not app_id or not app_type:
+            raise RuntimeError("FYERS_CLIENT_ID must be in APP_ID-APP_TYPE format")
+        return app_id, app_type
+
+    @staticmethod
+    def _find_access_token(payload: Dict[str, Any]) -> str:
+        if isinstance(payload.get("access_token"), str):
+            return str(payload["access_token"])
+        data = payload.get("data")
+        if isinstance(data, dict) and isinstance(data.get("access_token"), str):
+            return str(data["access_token"])
+        return ""
+
+    @staticmethod
+    def _extract_auth_code(payload: Dict[str, Any]) -> str:
+        for key in ("auth_code", "code"):
+            if isinstance(payload.get(key), str):
+                return str(payload[key])
+        url = payload.get("Url") or payload.get("url") or payload.get("redirect_url")
+        if isinstance(url, str):
+            parsed = parse_qs(urlparse(url).query)
+            values = parsed.get("auth_code") or parsed.get("code")
+            if values:
+                return str(values[0])
+        return ""
+
+    @staticmethod
+    def _fyers_post_json(
+        url: str,
+        payload: Dict[str, Any],
+        label: str,
+        headers: Optional[Dict[str, str]] = None,
+        allowed_statuses: Optional[set[int]] = None,
+        allow_redirects: bool = True,
+    ) -> Dict[str, Any]:
+        allowed = allowed_statuses or {200}
+        response = requests.post(
+            url=url,
+            json=payload,
+            headers=headers,
+            timeout=20,
+            allow_redirects=allow_redirects,
+        )
+        if response.status_code not in allowed:
+            raise RuntimeError(f"{label} failed with HTTP {response.status_code}: {response.text}")
+        try:
+            result = response.json()
+        except ValueError as exc:
+            raise RuntimeError(f"{label} returned non-JSON response: {response.text}") from exc
+        if isinstance(result, dict) and result.get("s") == "error":
+            raise RuntimeError(f"{label} failed: {result}")
+        return result

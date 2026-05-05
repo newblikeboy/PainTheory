@@ -1502,6 +1502,9 @@ class AppState:
             secret_key=self.settings.fyers_secret_key,
             pin=self.settings.fyers_pin,
             redirect_uri=self.settings.fyers_redirect_uri,
+            user_id=self.settings.fyers_user_id,
+            totp_key=self.settings.fyers_totp_key,
+            login_app_id=self.settings.fyers_login_app_id,
             response_type=self.settings.fyers_response_type,
             scope=self.settings.fyers_scope,
             refresh_lead_sec=self.settings.fyers_refresh_lead_sec,
@@ -1598,6 +1601,25 @@ class AppState:
         )
         self.quote_client: Optional[FyersQuoteClient] = None
         self.fyers_token_generation: int = 0
+        self.fyers_token_scheduler_task: Optional[asyncio.Task] = None
+        self.fyers_token_scheduler_status: Dict[str, Any] = {
+            "running": False,
+            "last_run_at": "",
+            "last_success_at": "",
+            "next_run_at": "",
+            "last_error": "",
+        }
+        self.angel_token_scheduler_task: Optional[asyncio.Task] = None
+        self.angel_token_scheduler_status: Dict[str, Any] = {
+            "running": False,
+            "last_run_at": "",
+            "last_success_at": "",
+            "next_run_at": "",
+            "last_error": "",
+            "last_total": 0,
+            "last_success_count": 0,
+            "last_failure_count": 0,
+        }
         if (
             self.settings.stream_mode == "fyers"
             and self.settings.fyers_client_id
@@ -3688,10 +3710,21 @@ def _fyers_status_payload(state: AppState) -> Dict[str, Any]:
     return {
         "authenticated": bool(status.get("authenticated")),
         "has_access_token": bool(status.get("has_access_token")),
+        "has_refresh_token": bool(status.get("has_refresh_token")),
         "client_id": str(status.get("client_id") or state.settings.fyers_client_id or "").strip(),
         "generated_at": int(status.get("generated_at") or 0),
         "access_token_expires_at": int(status.get("access_token_expires_at") or 0),
+        "refresh_token_expires_at": int(status.get("refresh_token_expires_at") or 0),
         "seconds_to_access_expiry": int(status.get("seconds_to_access_expiry") or 0),
+        "seconds_to_refresh_expiry": int(status.get("seconds_to_refresh_expiry") or 0),
+        "needs_refresh": bool(status.get("needs_refresh")),
+        "refresh_valid": bool(status.get("refresh_valid")),
+        "totp_configured": bool(status.get("totp_configured")),
+        "totp_refresh_time": (
+            f"{int(state.settings.fyers_totp_refresh_hour):02d}:"
+            f"{int(state.settings.fyers_totp_refresh_minute):02d} IST"
+        ),
+        "totp_scheduler": dict(state.fyers_token_scheduler_status),
     }
 
 
@@ -3827,6 +3860,206 @@ def _clear_fyers_access_token(state: AppState, *, reason: str) -> bool:
     state.fyers_token_generation += 1
     logger.warning("FYERS access token cleared after %s; manual re-authentication is required.", reason)
     return True
+
+
+def _next_fyers_totp_refresh_time(state: AppState, now: Optional[datetime] = None) -> datetime:
+    current = now or datetime.now(_IST)
+    run_at = current.replace(
+        hour=int(state.settings.fyers_totp_refresh_hour),
+        minute=int(state.settings.fyers_totp_refresh_minute),
+        second=0,
+        microsecond=0,
+    )
+    if run_at <= current:
+        run_at += timedelta(days=1)
+    return run_at
+
+
+async def _refresh_fyers_access_token_with_totp(state: AppState, *, source: str) -> bool:
+    status_obj = state.fyers_token_scheduler_status
+    status_obj["last_run_at"] = datetime.now(_IST).isoformat(timespec="seconds")
+    status_obj["last_error"] = ""
+    try:
+        refreshed = await asyncio.to_thread(state.fyers_auth.refresh_access_token_with_totp)
+        token = str(refreshed.get("access_token") or "").strip()
+        ok = bool(token)
+        if ok:
+            _apply_fyers_access_token(state, token, reason=f"TOTP {source}")
+            status_obj["last_success_at"] = datetime.now(_IST).isoformat(timespec="seconds")
+            logger.info("FYERS TOTP token refresh completed from %s", source)
+        else:
+            status_obj["last_error"] = "FYERS TOTP response did not include access_token"
+        return ok
+    except Exception as exc:
+        status_obj["last_error"] = str(exc)
+        logger.exception("FYERS TOTP token refresh failed from %s", source)
+        return False
+
+
+async def fyers_token_scheduler_loop(state: AppState) -> None:
+    status_obj = state.fyers_token_scheduler_status
+    try:
+        while True:
+            next_run = _next_fyers_totp_refresh_time(state)
+            status_obj["running"] = True
+            status_obj["next_run_at"] = next_run.isoformat(timespec="seconds")
+            wait_seconds = max(0.0, (next_run - datetime.now(_IST)).total_seconds())
+            await asyncio.sleep(wait_seconds)
+            await _refresh_fyers_access_token_with_totp(state, source="scheduler")
+    except asyncio.CancelledError:
+        status_obj["running"] = False
+        raise
+
+
+def _next_angel_totp_refresh_time(state: AppState, now: Optional[datetime] = None) -> datetime:
+    current = now or datetime.now(_IST)
+    run_at = current.replace(
+        hour=int(state.settings.angel_totp_refresh_hour),
+        minute=int(state.settings.angel_totp_refresh_minute),
+        second=0,
+        microsecond=0,
+    )
+    if run_at <= current:
+        run_at += timedelta(days=1)
+    return run_at
+
+
+def _angel_login_payload_from_session(state: AppState, session: Dict[str, Any]) -> Dict[str, Any]:
+    username = str(session.get("username") or "").strip().lower()
+    client_id = str(session.get("client_id") or "").strip()
+    api_key = str(session.get("api_key") or state.settings.angel_api_key or "").strip()
+    pin = str(session.get("pin") or "").strip()
+    totp_secret = str(session.get("totp_secret") or "").strip()
+    if not username:
+        raise RuntimeError("username is missing")
+    if not client_id:
+        raise RuntimeError("Angel client id is missing")
+    if not api_key:
+        raise RuntimeError("Angel API key is missing")
+    if not pin:
+        raise RuntimeError("Angel PIN is missing")
+    if not totp_secret:
+        raise RuntimeError("Angel TOTP secret is missing")
+    try:
+        totp_code = _generate_totp_code(totp_secret)
+    except Exception as exc:
+        raise RuntimeError(f"Invalid Angel TOTP secret: {exc}") from exc
+    return {
+        "username": username,
+        "client_id": client_id,
+        "api_key": api_key,
+        "payload": {
+            "clientcode": client_id,
+            "password": pin,
+            "totp": totp_code,
+            "state": f"terminal-{int(time.time())}",
+        },
+    }
+
+
+async def _login_angel_one_session(state: AppState, session: Dict[str, Any], *, source: str) -> Dict[str, Any]:
+    login = _angel_login_payload_from_session(state, session)
+    username = str(login["username"])
+    client_id = str(login["client_id"])
+    api_key = str(login["api_key"])
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-UserType": "USER",
+        "X-SourceID": "WEB",
+        "X-ClientLocalIP": str(state.settings.angel_client_local_ip or "127.0.0.1"),
+        "X-ClientPublicIP": str(state.settings.angel_client_public_ip or "0.0.0.0"),
+        "X-MACAddress": str(state.settings.angel_client_mac or "00:00:00:00:00:00"),
+        "X-PrivateKey": api_key,
+    }
+    try:
+        resp = await asyncio.to_thread(
+            requests.post,
+            "https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword",
+            json=login["payload"],
+            headers=headers,
+            timeout=15,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Angel terminal login request failed: {exc}") from exc
+
+    try:
+        body = resp.json() if resp.content else {}
+    except ValueError:
+        body = {}
+    if int(getattr(resp, "status_code", 500)) >= 400:
+        raise RuntimeError(f"Angel terminal login HTTP {resp.status_code}.")
+    if isinstance(body, dict) and body.get("status") is False:
+        message = str(body.get("message") or body.get("errorcode") or "Angel login failed").strip()
+        raise RuntimeError(message)
+
+    data = body.get("data") if isinstance(body, dict) else {}
+    access_token = str((data or {}).get("jwtToken") or "").strip()
+    refresh_token = str((data or {}).get("refreshToken") or "").strip()
+    feed_token = str((data or {}).get("feedToken") or "").strip()
+    if not access_token:
+        raise RuntimeError("Angel login succeeded but jwtToken was missing.")
+
+    decoded = _jwt_payload(access_token)
+    token_expires_at = _to_int(decoded.get("exp"), 0)
+    saved = await asyncio.to_thread(
+        state.user_auth.save_user_angel_session,
+        username=username,
+        client_id=client_id,
+        auth_token="",
+        access_token=access_token,
+        feed_token=feed_token,
+        refresh_token=refresh_token,
+        token_expires_at=token_expires_at,
+    )
+    logger.info("Angel One token refreshed from %s for user=%s", source, username)
+    return saved
+
+
+async def _refresh_connected_angel_tokens(state: AppState, *, source: str) -> Dict[str, Any]:
+    status_obj = state.angel_token_scheduler_status
+    status_obj["last_run_at"] = datetime.now(_IST).isoformat(timespec="seconds")
+    status_obj["last_error"] = ""
+    sessions = await asyncio.to_thread(state.user_auth.list_connected_angel_login_sessions, 5000)
+    total = len(sessions)
+    success_count = 0
+    failures: List[str] = []
+    for session in sessions:
+        username = str(session.get("username") or "").strip().lower()
+        try:
+            await _login_angel_one_session(state, session, source=source)
+            success_count += 1
+        except Exception as exc:
+            failures.append(f"{username or 'unknown'}: {exc}")
+            logger.warning("Angel One token refresh failed from %s for user=%s: %s", source, username or "unknown", exc)
+    failure_count = total - success_count
+    status_obj["last_total"] = total
+    status_obj["last_success_count"] = success_count
+    status_obj["last_failure_count"] = failure_count
+    if success_count:
+        status_obj["last_success_at"] = datetime.now(_IST).isoformat(timespec="seconds")
+    status_obj["last_error"] = "; ".join(failures[:5])
+    return {
+        "total": total,
+        "success_count": success_count,
+        "failure_count": failure_count,
+        "failures": failures,
+    }
+
+
+async def angel_token_scheduler_loop(state: AppState) -> None:
+    status_obj = state.angel_token_scheduler_status
+    try:
+        while True:
+            next_run = _next_angel_totp_refresh_time(state)
+            status_obj["running"] = True
+            status_obj["next_run_at"] = next_run.isoformat(timespec="seconds")
+            wait_seconds = max(0.0, (next_run - datetime.now(_IST)).total_seconds())
+            await asyncio.sleep(wait_seconds)
+            await _refresh_connected_angel_tokens(state, source="scheduler")
+    except asyncio.CancelledError:
+        status_obj["running"] = False
+        raise
 
 
 def _option_snapshot_signature(snapshot: Dict[str, Any]) -> tuple[Any, ...]:
@@ -4881,6 +5114,13 @@ async def startup_event() -> None:
             saved_token = ""
         if saved_token:
             _apply_fyers_access_token(state, saved_token, reason="startup saved access token")
+        elif state.fyers_auth.is_totp_configured():
+            await _refresh_fyers_access_token_with_totp(state, source="startup")
+    if state.settings.stream_mode == "fyers" and state.fyers_auth.is_totp_configured():
+        state.fyers_token_scheduler_task = asyncio.create_task(fyers_token_scheduler_loop(state))
+    elif state.settings.stream_mode == "fyers":
+        state.fyers_token_scheduler_status["last_error"] = "FYERS TOTP configuration is incomplete"
+    state.angel_token_scheduler_task = asyncio.create_task(angel_token_scheduler_loop(state))
     if state.settings.stream_mode == "fyers":
         asyncio.create_task(stream_loop(state))
         asyncio.create_task(option_chain_loop(state))
@@ -4891,6 +5131,25 @@ async def startup_event() -> None:
         asyncio.create_task(model_retrain_loop(state))
     if state.settings.db_retention_enabled:
         asyncio.create_task(db_retention_loop(state))
+
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    state: AppState = app.state.state
+    task = state.fyers_token_scheduler_task
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    angel_task = state.angel_token_scheduler_task
+    if angel_task is not None:
+        angel_task.cancel()
+        try:
+            await angel_task
+        except asyncio.CancelledError:
+            pass
 
 
 @app.get("/health")
@@ -5486,7 +5745,13 @@ async def live_execution_status(
 ) -> Dict[str, Any]:
     state: AppState = app.state.state
     _require_admin(state, _authorization_from_request(authorization, request))
-    return state.live_execution.get_status()
+    payload = state.live_execution.get_status()
+    payload["angel_token_scheduler"] = dict(state.angel_token_scheduler_status)
+    payload["angel_token_refresh_time"] = (
+        f"{int(state.settings.angel_totp_refresh_hour):02d}:"
+        f"{int(state.settings.angel_totp_refresh_minute):02d} IST"
+    )
+    return payload
 
 
 @app.get("/admin/execution/lot-size")
@@ -5715,82 +5980,10 @@ async def user_broker_angel_one_login(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
-    client_id = str(session.get("client_id") or "").strip()
-    api_key = str(session.get("api_key") or state.settings.angel_api_key or "").strip()
-    pin = str(session.get("pin") or "").strip()
-    totp_secret = str(session.get("totp_secret") or "").strip()
-    if not client_id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Set Angel client id first.")
-    if not api_key:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Set Angel API key first.")
-    if not pin:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Set Angel PIN first.")
-    if not totp_secret:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Set Angel TOTP secret first.")
-
     try:
-        totp_code = _generate_totp_code(totp_secret)
-    except Exception as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid Angel TOTP secret: {exc}") from exc
-
-    payload = {
-        "clientcode": client_id,
-        "password": pin,
-        "totp": totp_code,
-        "state": f"terminal-{int(time.time())}",
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "X-UserType": "USER",
-        "X-SourceID": "WEB",
-        "X-ClientLocalIP": str(state.settings.angel_client_local_ip or "127.0.0.1"),
-        "X-ClientPublicIP": str(state.settings.angel_client_public_ip or "0.0.0.0"),
-        "X-MACAddress": str(state.settings.angel_client_mac or "00:00:00:00:00:00"),
-        "X-PrivateKey": api_key,
-    }
-    try:
-        resp = await asyncio.to_thread(
-            requests.post,
-            "https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword",
-            json=payload,
-            headers=headers,
-            timeout=15,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Angel terminal login request failed: {exc}") from exc
-
-    try:
-        body = resp.json() if resp.content else {}
-    except ValueError:
-        body = {}
-    if int(getattr(resp, "status_code", 500)) >= 400:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Angel terminal login HTTP {resp.status_code}.")
-    if isinstance(body, dict) and body.get("status") is False:
-        message = str(body.get("message") or body.get("errorcode") or "Angel login failed").strip()
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message)
-
-    data = body.get("data") if isinstance(body, dict) else {}
-    access_token = str((data or {}).get("jwtToken") or "").strip()
-    refresh_token = str((data or {}).get("refreshToken") or "").strip()
-    feed_token = str((data or {}).get("feedToken") or "").strip()
-    if not access_token:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Angel login succeeded but jwtToken was missing.")
-
-    decoded = _jwt_payload(access_token)
-    token_expires_at = _to_int(decoded.get("exp"), 0)
-    try:
-        state.user_auth.save_user_angel_session(
-            username=username,
-            client_id=client_id,
-            auth_token="",
-            access_token=access_token,
-            feed_token=feed_token,
-            refresh_token=refresh_token,
-            token_expires_at=token_expires_at,
-        )
+        await _login_angel_one_session(state, session, source="manual")
         config = state.user_auth.get_user_broker_config(username)
-    except ValueError as exc:
+    except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return {"ok": True, "config": config}
 
@@ -6387,6 +6580,34 @@ async def fyers_url(
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return {"auth_url": auth_url}
+
+
+@app.get("/auth/fyers/callback")
+async def fyers_callback(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    auth_code: Optional[str] = None,
+    code: Optional[str] = None,
+) -> Dict[str, Any]:
+    state: AppState = app.state.state
+    _require_admin(state, _authorization_from_request(authorization, request))
+    token = str(auth_code or code or "").strip()
+    if not token:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="auth_code is required")
+    try:
+        exchanged = state.fyers_auth.exchange_auth_code(token)
+        _apply_fyers_access_token(
+            state,
+            str(exchanged.get("access_token", "")).strip(),
+            reason="FYERS callback",
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "access_token_expires_at": exchanged.get("access_token_expires_at", 0),
+        "authenticated": bool(exchanged.get("authenticated", False)),
+    }
 
 
 @app.post("/auth/fyers/exchange")

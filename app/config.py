@@ -219,6 +219,8 @@ class Settings:
     angel_client_local_ip: str
     angel_client_public_ip: str
     angel_client_mac: str
+    angel_totp_refresh_hour: int
+    angel_totp_refresh_minute: int
     central_live_execution_enabled: bool
     central_live_execution_quantity: int
     central_live_execution_exchange: str
@@ -234,10 +236,15 @@ class Settings:
     razorpay_subscribe_amount_paisa: int
     fyers_secret_key: str
     fyers_pin: str
+    fyers_user_id: str
+    fyers_totp_key: str
+    fyers_login_app_id: str
     fyers_redirect_uri: str
     fyers_response_type: str
     fyers_scope: str
     fyers_refresh_lead_sec: int
+    fyers_totp_refresh_hour: int
+    fyers_totp_refresh_minute: int
     runtime_preload_enabled: bool
     runtime_preload_candles: int
     runtime_preload_table_1m: str
@@ -367,6 +374,8 @@ def load_settings() -> Settings:
         angel_client_local_ip=_get_text("CLIENT_LOCAL_IP", "127.0.0.1"),
         angel_client_public_ip=_get_text("CLIENT_PUBLIC_IP", "0.0.0.0"),
         angel_client_mac=_get_text("CLIENT_MAC", "00:00:00:00:00:00"),
+        angel_totp_refresh_hour=max(0, min(23, _get_int("ANGEL_TOTP_REFRESH_HOUR", 8))),
+        angel_totp_refresh_minute=max(0, min(59, _get_int("ANGEL_TOTP_REFRESH_MINUTE", 0))),
         central_live_execution_enabled=_get_bool("CENTRAL_LIVE_EXECUTION_ENABLED", False),
         central_live_execution_quantity=max(1, _get_int("CENTRAL_LIVE_EXECUTION_QUANTITY", 1)),
         central_live_execution_exchange=_get_text("CENTRAL_LIVE_EXECUTION_EXCHANGE", "NFO"),
@@ -382,10 +391,15 @@ def load_settings() -> Settings:
         razorpay_subscribe_amount_paisa=max(100, _get_int("RAZORPAY_SUBSCRIBE_AMOUNT_PAISA", 49900)),
         fyers_secret_key=_get_text("FYERS_SECRET_KEY", ""),
         fyers_pin=_get_text("FYERS_PIN", ""),
+        fyers_user_id=_get_text("FYERS_USER_ID", ""),
+        fyers_totp_key=_get_text("FYERS_TOTP_KEY", ""),
+        fyers_login_app_id=_get_text("FYERS_LOGIN_APP_ID", "2"),
         fyers_redirect_uri=_get_text("FYERS_REDIRECT_URI", ""),
         fyers_response_type=_get_text("FYERS_RESPONSE_TYPE", "code"),
         fyers_scope=_get_text("FYERS_SCOPE", ""),
         fyers_refresh_lead_sec=_get_int("FYERS_REFRESH_LEAD_SEC", 300),
+        fyers_totp_refresh_hour=max(0, min(23, _get_int("FYERS_TOTP_REFRESH_HOUR", 8))),
+        fyers_totp_refresh_minute=max(0, min(59, _get_int("FYERS_TOTP_REFRESH_MINUTE", 0))),
         runtime_preload_enabled=_get_bool("RUNTIME_PRELOAD_ENABLED", True),
         runtime_preload_candles=_get_int("RUNTIME_PRELOAD_CANDLES", 300),
         runtime_preload_table_1m=_get_text("RUNTIME_PRELOAD_TABLE_1M", "candles_1m"),

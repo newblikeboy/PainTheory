@@ -8,3 +8,5 @@ uvicorn[standard]==0.41.0
 pydantic==2.12.5
 tzdata==2025.2
 mysql-connector-python==9.6.0
+requests==2.31.0
+pyotp==2.9.0
