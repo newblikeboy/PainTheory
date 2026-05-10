@@ -4,7 +4,7 @@
 
 logs/**/*.log
 
-# Local runtime files
-
+# Environment variables
 .env
-.env.example
+.env.*
+!.env.example

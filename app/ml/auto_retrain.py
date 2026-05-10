@@ -570,9 +570,9 @@ class AutoRetrainService:
     @staticmethod
     def _expected_sign(next_group: str, direction: str) -> int:
         group = str(next_group or "").strip().lower()
-        if group == "put_buyers":
+        if group in {"put_buyers", "call_sellers", "bearish_pain", "bearish"}:
             return 1
-        if group == "call_buyers":
+        if group in {"call_buyers", "put_sellers", "bullish_pain", "bullish"}:
             return -1
         direct = str(direction or "").strip().upper()
         if direct == "LONG":
@@ -845,6 +845,85 @@ class AutoRetrainService:
             )
         return out
 
+    def _fetch_missed_opportunity_labels(
+        self,
+        conn: Any,
+        *,
+        since_ts: int,
+        until_ts: int,
+    ) -> List[Dict[str, Any]]:
+        table = str(getattr(self.settings, "paper_trade_mysql_missed_table", "") or "").strip()
+        if not table:
+            return []
+        columns = self._table_columns(conn, table)
+        signal_ts_col = self._pick(columns, "signal_ts")
+        outcome_col = self._pick(columns, "outcome")
+        points_col = self._pick(columns, "points")
+        signal_col = self._pick(columns, "signal_json")
+        skipped_col = self._pick(columns, "skipped_reason")
+        if not (signal_ts_col and outcome_col and signal_col):
+            return []
+        fields = [
+            f"`{signal_ts_col}` AS signal_ts",
+            f"`{outcome_col}` AS outcome",
+            f"`{signal_col}` AS signal_json",
+        ]
+        if points_col:
+            fields.append(f"`{points_col}` AS points")
+        if skipped_col:
+            fields.append(f"`{skipped_col}` AS skipped_reason")
+        cur = conn.cursor(dictionary=True)
+        try:
+            cur.execute(
+                f"""
+                SELECT {", ".join(fields)}
+                FROM `{table}`
+                WHERE `{signal_ts_col}` >= %s
+                  AND `{signal_ts_col}` <= %s
+                  AND LOWER(COALESCE(`{outcome_col}`, 'pending')) IN ('profit', 'loss', 'flat')
+                ORDER BY `{signal_ts_col}` ASC
+                """,
+                (int(since_ts), int(until_ts)),
+            )
+            rows = cur.fetchall() or []
+        except Exception:
+            return []
+        finally:
+            cur.close()
+
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            signal_raw = row.get("signal_json")
+            if isinstance(signal_raw, (bytes, bytearray)):
+                signal_raw = signal_raw.decode("utf-8", errors="ignore")
+            try:
+                signal = json.loads(str(signal_raw or "{}"))
+                if not isinstance(signal, dict):
+                    signal = {}
+            except Exception:
+                signal = {}
+            label_ts = _to_int(row.get("signal_ts"), 0)
+            if label_ts <= 0:
+                continue
+            outcome = str(row.get("outcome") or "").strip().lower()
+            points = _to_float(row.get("points"), 0.0)
+            profitable = bool(outcome == "profit" and points > 0.0)
+            out.append(
+                {
+                    "timestamp": label_ts,
+                    "pain_phase": str(signal.get("pain_phase") or "comfort"),
+                    "dominant_pain_group": str(signal.get("dominant_pain_group") or "none"),
+                    "next_likely_pain_group": str(signal.get("next_likely_pain_group") or "none"),
+                    "guidance": str(signal.get("guidance") or "observe"),
+                    "entry_trigger": "1" if profitable else "0",
+                    "stop_loss_distance": _to_float(signal.get("stop_loss_distance"), 0.0),
+                    "target_level": _to_float(signal.get("target_level"), 0.0),
+                    "mistake_type": "no_trade" if profitable else "none",
+                    "mistake_score": min(1.0, max(0.0, abs(points) / max(1.0, _to_float(signal.get("target_level"), 1.0)))),
+                }
+            )
+        return out
+
     @staticmethod
     def _write_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
         file_path = Path(path)
@@ -922,8 +1001,10 @@ class AutoRetrainService:
 
         recall_guard_cfg = [
             ("entry_trigger", "1", 8, 0.12, max(self.max_core_drop * 1.5, 0.06)),
-            ("next_likely_pain_group", "bearish", 25, 0.22, max(self.max_core_drop * 2.0, 0.08)),
-            ("next_likely_pain_group", "bullish", 25, 0.22, max(self.max_core_drop * 2.0, 0.08)),
+            ("next_likely_pain_group", "call_buyers", 25, 0.18, max(self.max_core_drop * 2.0, 0.08)),
+            ("next_likely_pain_group", "put_buyers", 25, 0.18, max(self.max_core_drop * 2.0, 0.08)),
+            ("next_likely_pain_group", "call_sellers", 25, 0.18, max(self.max_core_drop * 2.0, 0.08)),
+            ("next_likely_pain_group", "put_sellers", 25, 0.18, max(self.max_core_drop * 2.0, 0.08)),
             ("mistake_type", "false_entry", 6, 0.08, max(self.max_core_drop * 2.0, 0.06)),
             ("mistake_type", "chop_zone", 6, 0.08, max(self.max_core_drop * 2.0, 0.06)),
         ]
@@ -1044,12 +1125,19 @@ class AutoRetrainService:
             conn = self._connect_mysql()
             candles = self._fetch_candles(conn, since_ts=since_ts, until_ts=now_ts)
             options = self._fetch_options(conn, since_ts=since_ts, until_ts=now_ts)
-            labels = self._fetch_trade_labels(
+            trade_labels = self._fetch_trade_labels(
                 conn,
                 since_ts=since_ts,
                 until_ts=now_ts,
                 candles=candles,
             )
+            missed_labels = self._fetch_missed_opportunity_labels(
+                conn,
+                since_ts=since_ts,
+                until_ts=now_ts,
+            )
+            # Trade outcomes are the stronger truth when both sources share a timestamp.
+            labels = list(missed_labels) + list(trade_labels)
             conn.close()
             conn = None
 
@@ -1145,6 +1233,8 @@ class AutoRetrainService:
                 "candles_rows": len(candles),
                 "options_rows": len(options),
                 "labels_rows": len(labels),
+                "trade_labels_rows": len(trade_labels),
+                "missed_labels_rows": len(missed_labels),
                 "mistake_rows": sum(1 for item in labels if str(item.get("mistake_type") or "none") != "none"),
                 "candidate_model_path": self.candidate_path,
                 "active_model_path": self.settings.pain_ai_model_path,

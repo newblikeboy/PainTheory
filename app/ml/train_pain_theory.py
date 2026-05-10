@@ -23,6 +23,7 @@ from ..pain_theory_ai.core import (
     classify_from_rules,
     dual_feature_columns,
 )
+from ..pain_theory_ai.timeframes import available_higher_timeframe_end_index
 
 
 TARGETS = (
@@ -49,13 +50,6 @@ MISTAKE_TYPES = (
     "expiry_noise",
     "unclassified_loss",
 )
-
-MARKET_DIRECTIONS = (
-    "bullish",
-    "bearish",
-    "neutral",
-)
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Pain Theory AI multi-head classifiers/regressors")
@@ -246,31 +240,15 @@ def _label_maps(rows: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
 
 def _group_to_direction(next_group: str) -> int:
     text = str(next_group or "").strip().lower()
-    if text == "bearish":
+    if text in {"bearish_pain", "bearish"}:
         return 1
-    if text == "bullish":
+    if text in {"bullish_pain", "bullish"}:
         return -1
     if text in {"put_buyers", "call_sellers"}:
         return 1
     if text in {"call_buyers", "put_sellers"}:
         return -1
     return 0
-
-
-def _group_to_3class(group: str) -> str:
-    """
-    Map 6 pain groups to 3 market direction classes for improved prediction accuracy.
-    
-    Bullish: call_buyers (profit from up) + put_sellers (profit from up)
-    Bearish: put_buyers (profit from down) + call_sellers (profit from down)  
-    Neutral: buyers_both (no bias) + none (no bias)
-    """
-    text = str(group or "").strip().lower()
-    if text in {"call_buyers", "put_sellers"}:
-        return "bullish"
-    if text in {"put_buyers", "call_sellers"}:
-        return "bearish"
-    return "neutral"
 
 
 def _derive_trade_targets(
@@ -338,7 +316,7 @@ def _build_samples(
         current_ts = int(candles_1m[idx]["timestamp"])
         if idx < window_1m - 1:
             continue
-        end_5m = bisect_right(candles_5m_ts, current_ts)
+        end_5m = available_higher_timeframe_end_index(candles_5m_ts, current_ts)
         if end_5m < window_5m:
             continue
         end_opt = bisect_right(options_ts, current_ts) if options_ts else 0
@@ -360,11 +338,11 @@ def _build_samples(
         else:
             target_now = classify_from_rules(features, last_phase)
 
-        # ALWAYS use look-ahead to get actual future dominant_group as ground truth
-        # This replaces rule-based guesses with verified outcomes from historical data
+        # Train next_likely_pain_group on the actual future pain group.
+        # This target means "who is likely in pain", not market direction.
         future_idx = min(len(candles_1m) - 1, idx + max(1, next_horizon))
         future_ts = int(candles_1m[future_idx]["timestamp"])
-        future_end_5m = bisect_right(candles_5m_ts, future_ts)
+        future_end_5m = available_higher_timeframe_end_index(candles_5m_ts, future_ts)
         future_end_opt = bisect_right(options_ts, future_ts) if options_ts else 0
         future_execution_window = candles_1m[max(0, future_idx - window_1m + 1) : future_idx + 1]
         future_analysis_window = candles_5m[max(0, future_end_5m - window_5m) : future_end_5m]
@@ -386,11 +364,12 @@ def _build_samples(
         )
         next_state = classify_from_rules(future_features, str(target_now.get("pain_phase", "comfort")))
         
-        # Get actual future dominant_group as 6-class ground truth
-        next_label_6class = str(next_state.get("dominant_pain_group", "none") or "none")
+        next_label = _normalize_label(
+            str(next_state.get("dominant_pain_group", "none") or "none"),
+            PARTICIPANT_GROUPS,
+            "none",
+        )
         
-        # Convert to 3-class for improved accuracy (18% → 35-45%)
-        next_label = _group_to_3class(next_label_6class)
 
         horizon_end = min(len(candles_1m), idx + 1 + max(1, next_horizon))
         future_window = candles_1m[idx + 1 : horizon_end]
@@ -425,7 +404,7 @@ def _build_samples(
                 PARTICIPANT_GROUPS,
                 "none",
             ),
-            "next_likely_pain_group": _normalize_label(next_label, MARKET_DIRECTIONS, "neutral"),
+            "next_likely_pain_group": _normalize_label(next_label, PARTICIPANT_GROUPS, "none"),
             "guidance": _normalize_label(target_now.get("guidance", ""), GUIDANCE_CHOICES, "observe"),
             "entry_trigger": entry_trigger,
             "mistake_type": _normalize_mistake_label((row_label or {}).get("mistake_type", "none"), "none"),
@@ -697,6 +676,8 @@ def train(
         "input_candles_5m": candles_5m_path if candles_5m_path else "aggregated_from_1m",
         "input_options": options_path if options_path else "",
         "input_labels": labels_path if labels_path else "",
+        "timeframe_alignment": "closed_only_start_timestamps",
+        "next_likely_pain_group_schema": "future_dominant_pain_group_6class",
         "feature_count": len(feature_columns),
         "sample_weight": {
             "train_mean": float(sum(w_train) / max(1, len(w_train))),

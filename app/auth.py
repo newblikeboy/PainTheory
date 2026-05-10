@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import hmac
 import json
@@ -143,6 +144,8 @@ class MySQLUserAuthStore(UserAuthStore):
         self.secret = secret.encode("utf-8")
         self.session_ttl_sec = max(300, int(session_ttl_sec))
         self._lock = threading.Lock()
+        self._session_cache: Dict[str, Dict[str, Any]] = {}
+        self._session_cache_ttl_sec = 8
 
         if not self.database or not re.fullmatch(r"[a-zA-Z0-9_]+", self.database):
             raise RuntimeError("AUTH_MYSQL_DATABASE must contain only letters, numbers, and underscores")
@@ -919,28 +922,34 @@ class MySQLUserAuthStore(UserAuthStore):
                     (now, normalized),
                 )
                 conn.commit()
+                user_payload = {
+                    "username": normalized,
+                    "email": self._to_row_value(row, "email", normalized),
+                    "full_name": self._to_row_value(row, "full_name"),
+                    "mobile_number": self._to_row_value(row, "mobile_number"),
+                    "angel_one_client_id": self._to_row_value(row, "angel_one_client_id"),
+                    "angel_one_connected": _to_int(row.get("angel_one_connected"), 0) > 0,
+                    "trading_engine_enabled": _to_int(row.get("trading_engine_enabled"), 0) > 0 and paid_active,
+                    "user_lot_count": self._normalize_user_lot_count(row.get("user_lot_count")),
+                    "subscription_active": paid_active,
+                    "subscription_plan_code": self._to_row_value(row, "subscription_plan_code"),
+                    "subscription_started_at": _to_int(row.get("subscription_started_at"), 0),
+                    "subscription_expires_at": _to_int(row.get("subscription_expires_at"), 0),
+                    "plan_name": self._to_row_value(row, "subscription_plan_name"),
+                    "role": role,
+                    "created_at": _to_int(row.get("created_at"), 0),
+                    "last_login_at": now,
+                }
+                self._session_cache[token_hash] = {
+                    "cached_until": now + self._session_cache_ttl_sec,
+                    "expires_at": expires_at,
+                    "user": copy.deepcopy(user_payload),
+                }
                 return {
                     "access_token": token,
                     "token_type": "bearer",
                     "expires_at": expires_at,
-                    "user": {
-                        "username": normalized,
-                        "email": self._to_row_value(row, "email", normalized),
-                        "full_name": self._to_row_value(row, "full_name"),
-                        "mobile_number": self._to_row_value(row, "mobile_number"),
-                        "angel_one_client_id": self._to_row_value(row, "angel_one_client_id"),
-                        "angel_one_connected": _to_int(row.get("angel_one_connected"), 0) > 0,
-                        "trading_engine_enabled": _to_int(row.get("trading_engine_enabled"), 0) > 0 and paid_active,
-                        "user_lot_count": self._normalize_user_lot_count(row.get("user_lot_count")),
-                        "subscription_active": paid_active,
-                        "subscription_plan_code": self._to_row_value(row, "subscription_plan_code"),
-                        "subscription_started_at": _to_int(row.get("subscription_started_at"), 0),
-                        "subscription_expires_at": _to_int(row.get("subscription_expires_at"), 0),
-                        "plan_name": self._to_row_value(row, "subscription_plan_name"),
-                        "role": role,
-                        "created_at": _to_int(row.get("created_at"), 0),
-                        "last_login_at": now,
-                    },
+                    "user": user_payload,
                 }
             finally:
                 if cur is not None:
@@ -953,6 +962,14 @@ class MySQLUserAuthStore(UserAuthStore):
         if not token:
             return None
         token_hash = self._session_hash(token, self.secret)
+        now = _now()
+        cached = self._session_cache.get(token_hash)
+        if isinstance(cached, dict):
+            cached_until = _to_int(cached.get("cached_until"), 0)
+            expires_at = _to_int(cached.get("expires_at"), 0)
+            user = cached.get("user") if isinstance(cached.get("user"), dict) else None
+            if user is not None and cached_until > now and expires_at > now:
+                return copy.deepcopy(user)
 
         conn = None
         cur = None
@@ -961,10 +978,10 @@ class MySQLUserAuthStore(UserAuthStore):
                 conn = self._connect(with_database=True)
                 cur = conn.cursor(dictionary=True)
                 self._cleanup_sessions(conn)
-                now = _now()
                 cur.execute(
                     """
-                    SELECT u.email, u.username, u.full_name, u.mobile_number, u.angel_one_client_id,
+                    SELECT s.expires_at AS session_expires_at,
+                           u.email, u.username, u.full_name, u.mobile_number, u.angel_one_client_id,
                            u.angel_one_connected, u.trading_engine_enabled, u.user_lot_count,
                            u.subscription_active, u.subscription_plan_code, u.subscription_plan_name,
                            u.subscription_started_at, u.subscription_expires_at,
@@ -984,7 +1001,7 @@ class MySQLUserAuthStore(UserAuthStore):
                     return None
                 username = self._to_row_value(row, "username", self._to_row_value(row, "email"))
                 paid_active = self._is_paid_active(row, now_ts=now)
-                return {
+                user = {
                     "username": username,
                     "email": self._to_row_value(row, "email", username),
                     "full_name": self._to_row_value(row, "full_name"),
@@ -1002,6 +1019,14 @@ class MySQLUserAuthStore(UserAuthStore):
                     "created_at": _to_int(row.get("created_at"), 0),
                     "last_login_at": _to_int(row.get("last_login_at"), 0),
                 }
+                self._session_cache[token_hash] = {
+                    "cached_until": now + self._session_cache_ttl_sec,
+                    "expires_at": _to_int(row.get("session_expires_at"), now),
+                    "user": copy.deepcopy(user),
+                }
+                if len(self._session_cache) > 1000:
+                    self._session_cache.clear()
+                return user
             finally:
                 if cur is not None:
                     cur.close()
@@ -1730,6 +1755,7 @@ class MySQLUserAuthStore(UserAuthStore):
                 )
                 affected = int(cur.rowcount or 0)
                 conn.commit()
+                self._session_cache.pop(token_hash, None)
                 return affected > 0
             finally:
                 if cur is not None:

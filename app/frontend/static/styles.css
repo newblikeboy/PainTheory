@@ -378,6 +378,21 @@ body {
   grid-template-columns: 1.15fr 1.85fr;
 }
 
+.paper-missed-card {
+  grid-column: 1 / -1;
+}
+
+.paper-missed-wrap {
+  margin-top: 0.7rem;
+  max-height: 360px;
+  overflow: auto;
+}
+
+.paper-missed-table th:nth-child(4),
+.paper-missed-table td:nth-child(4) {
+  min-width: 16rem;
+}
+
 .backtest-grid {
   grid-template-columns: 1fr 1.4fr;
 }

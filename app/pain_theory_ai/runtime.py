@@ -227,8 +227,8 @@ class PainTheoryRuntime:
 
         score = float(context.get("score", 0.0))
         text = str(next_group or "").strip().lower()
-        long_signal = text in {"put_buyers", "call_sellers", "bearish"}
-        short_signal = text in {"call_buyers", "put_sellers", "bullish"}
+        long_signal = text in {"put_buyers", "call_sellers", "bearish_pain", "bearish"}
+        short_signal = text in {"call_buyers", "put_sellers", "bullish_pain", "bullish"}
         if not long_signal and not short_signal:
             return guidance, confidence, "neutral"
 

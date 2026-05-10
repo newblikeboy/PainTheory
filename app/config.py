@@ -289,6 +289,7 @@ class Settings:
     paper_trade_mysql_trades_table: str
     paper_trade_mysql_feedback_table: str
     paper_trade_mysql_mistakes_table: str
+    paper_trade_mysql_missed_table: str
     backtest_mysql_runs_table: str
     backtest_mysql_trades_table: str
 
@@ -462,6 +463,10 @@ def load_settings() -> Settings:
         paper_trade_mysql_trades_table=_get_text("PAPER_TRADE_MYSQL_TRADES_TABLE", "paper_trade_trades"),
         paper_trade_mysql_feedback_table=_get_text("PAPER_TRADE_MYSQL_FEEDBACK_TABLE", "paper_trade_feedback"),
         paper_trade_mysql_mistakes_table=_get_text("PAPER_TRADE_MYSQL_MISTAKES_TABLE", "paper_trade_mistakes"),
+        paper_trade_mysql_missed_table=_get_text(
+            "PAPER_TRADE_MYSQL_MISSED_TABLE",
+            "paper_trade_missed_opportunities",
+        ),
         backtest_mysql_runs_table=_get_text("BACKTEST_MYSQL_RUNS_TABLE", "backtest_runs"),
         backtest_mysql_trades_table=_get_text("BACKTEST_MYSQL_TRADES_TABLE", "backtest_trades"),
     )

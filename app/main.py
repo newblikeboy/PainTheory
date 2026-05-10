@@ -1,6 +1,7 @@
 import asyncio
 import calendar
 import base64
+import copy
 import hashlib
 import hmac
 import json
@@ -8,6 +9,7 @@ import logging
 import re
 import secrets
 import struct
+import threading
 import time
 import uuid
 from datetime import datetime, time as dt_time, timedelta, timezone
@@ -36,6 +38,7 @@ from .option_contracts import (
 )
 from .paper_trade import PaperTradeEngine
 from .pain_theory_ai import PainTheoryRuntime
+from .pain_theory_ai.timeframes import higher_timeframe_is_available
 from .stream.fyers_stream import FyersTickStream
 from .stream.option_chain import OptionChainPoller
 from .stream.fyers_quote import FyersQuoteClient
@@ -1512,6 +1515,8 @@ class AppState:
         self.current_1m: Optional[Dict[str, float]] = None
         self.current_5m: Optional[Dict[str, float]] = None
         self.last_tick: Optional[Dict[str, float]] = None
+        self.market_candle_cache: Dict[tuple[Any, ...], Dict[str, Any]] = {}
+        self.market_candle_cache_lock = threading.Lock()
         self.last_underlying_data_received_at: int = 0
         self.last_option_signature: Optional[tuple[Any, ...]] = None
         self.last_option_quote_received_at: int = 0
@@ -1596,6 +1601,7 @@ class AppState:
             mysql_trades_table=self.settings.paper_trade_mysql_trades_table,
             mysql_feedback_table=self.settings.paper_trade_mysql_feedback_table,
             mysql_mistakes_table=self.settings.paper_trade_mysql_mistakes_table,
+            mysql_missed_table=self.settings.paper_trade_mysql_missed_table,
             model_driven_execution=True,
             option_upnl_exit_points=self.settings.paper_trade_option_upnl_exit_points,
         )
@@ -3594,6 +3600,7 @@ def _db_readiness(state: AppState) -> Dict[str, Any]:
         "paper_trades": settings.paper_trade_mysql_trades_table,
         "paper_feedback": settings.paper_trade_mysql_feedback_table,
         "paper_mistakes": settings.paper_trade_mysql_mistakes_table,
+        "paper_missed": settings.paper_trade_mysql_missed_table,
         "backtest_runs": settings.backtest_mysql_runs_table,
         "backtest_trades": settings.backtest_mysql_trades_table,
     }
@@ -4134,7 +4141,7 @@ def _ingest_runtime(
         matched_5m: List[Dict[str, Any]] = []
         while candle_5m_idx < len(candles_5m_sorted):
             candle_5m_ts = _to_int(candles_5m_sorted[candle_5m_idx].get("timestamp"), 0)
-            if candle_5m_ts <= candle_ts:
+            if higher_timeframe_is_available(candle_5m_ts, candle_ts):
                 matched_5m.append(candles_5m_sorted[candle_5m_idx])
                 candle_5m_idx += 1
                 continue
@@ -4156,14 +4163,7 @@ def _ingest_runtime(
         )
         state.paper_trade.on_candle(candle, latest, last_option_seen)
 
-    if candle_5m_idx < len(candles_5m_sorted) or option_idx < len(options_sorted):
-        pending_options = options_sorted[option_idx:]
-        latest = state.pain_runtime.ingest(
-            candles=[],
-            candles_5m=candles_5m_sorted[candle_5m_idx:],
-            option_snapshots=pending_options,
-        )
-    elif not candles_sorted and (candles_5m_sorted or options_sorted):
+    if not candles_sorted and (candles_5m_sorted or options_sorted):
         latest = state.pain_runtime.ingest(
             candles=[],
             candles_5m=candles_5m_sorted,
@@ -4440,11 +4440,6 @@ async def process_tick(state: AppState, tick: Dict[str, float]) -> None:
     if closed_1m is None and closed_5m is None:
         return
     before_paper_state = state.paper_trade.get_state()
-    await asyncio.to_thread(
-        state.candle_store.persist_batch,
-        candles_1m=[closed_1m] if closed_1m is not None else [],
-        candles_5m=[closed_5m] if closed_5m is not None else [],
-    )
     _ingest_runtime(
         state,
         candles=[closed_1m] if closed_1m is not None else [],
@@ -4453,6 +4448,14 @@ async def process_tick(state: AppState, tick: Dict[str, float]) -> None:
     )
     after_paper_state = state.paper_trade.get_state()
     state.live_execution.observe_transition(before_paper_state, after_paper_state)
+    _spawn_background(
+        asyncio.to_thread(
+            state.candle_store.persist_batch,
+            candles_1m=[closed_1m] if closed_1m is not None else [],
+            candles_5m=[closed_5m] if closed_5m is not None else [],
+        ),
+        label="live candle persistence",
+    )
 
 
 async def stream_loop(state: AppState) -> None:
@@ -4552,10 +4555,16 @@ async def option_chain_loop(state: AppState) -> None:
                     signature = _option_snapshot_signature(snapshot)
                     if state.last_option_signature is not None and signature == state.last_option_signature:
                         return
-                    await asyncio.to_thread(state.option_store.persist_batch, [snapshot])
-                    await asyncio.to_thread(state.option_strike_store.persist_batch, [snapshot])
                     state.pain_runtime.ingest(candles=[], candles_5m=[], option_snapshots=[snapshot])
                     state.last_option_signature = signature
+                    _spawn_background(
+                        asyncio.to_thread(state.option_store.persist_batch, [snapshot]),
+                        label="option snapshot persistence",
+                    )
+                    _spawn_background(
+                        asyncio.to_thread(state.option_strike_store.persist_batch, [snapshot]),
+                        label="option strike persistence",
+                    )
 
             await poller.run(
                 on_option,
@@ -4831,6 +4840,28 @@ def _authorization_from_request(authorization: Optional[str], request: Optional[
     if token:
         return f"Bearer {token}"
     return ""
+
+
+def _spawn_background(coro: Any, *, label: str) -> None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            coro.close()
+        except Exception:
+            pass
+        return
+    task = loop.create_task(coro)
+
+    def _log_result(done: asyncio.Task) -> None:
+        try:
+            done.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.exception("%s failed: %s", label, exc)
+
+    task.add_done_callback(_log_result)
 
 
 def _urlsafe_b64_decode(text: str) -> bytes:
@@ -5277,15 +5308,25 @@ async def ingest(payload: IngestPayload) -> Dict[str, Any]:
         for row in payload.option_snapshots
         if _to_int(row.timestamp, 0) <= max_ts
     ]
-    await asyncio.to_thread(state.candle_store.persist_batch, candles_1m=candles_1m, candles_5m=candles_5m)
-    await asyncio.to_thread(state.option_store.persist_batch, option_rows)
-    await asyncio.to_thread(state.option_strike_store.persist_batch, option_rows)
     snapshot = _ingest_runtime(
         state=state,
         candles=candles_1m,
         candles_5m=candles_5m,
         option_snapshots=option_rows,
     )
+    _spawn_background(
+        asyncio.to_thread(state.candle_store.persist_batch, candles_1m=candles_1m, candles_5m=candles_5m),
+        label="ingest candle persistence",
+    )
+    if option_rows:
+        _spawn_background(
+            asyncio.to_thread(state.option_store.persist_batch, option_rows),
+            label="ingest option persistence",
+        )
+        _spawn_background(
+            asyncio.to_thread(state.option_strike_store.persist_batch, option_rows),
+            label="ingest option strike persistence",
+        )
     return _pain_state_response(snapshot)
 
 
@@ -5316,29 +5357,55 @@ async def market_candles(
     since_ts = max(0, int(since or 0))
     max_ts = _max_allowed_timestamp(future_slack_sec=state.settings.max_future_timestamp_sec)
     raw_state_obj = state.pain_runtime.get_state()
-    try:
-        rows_1m = (
+    cache_key = (timeframe_key, max_rows, since_ts)
+    cache_ttl_sec = 2.0 if since_ts <= 0 else 0.75
+    now_mono = time.monotonic()
+    with state.market_candle_cache_lock:
+        cached = state.market_candle_cache.get(cache_key)
+        if (
+            isinstance(cached, dict)
+            and now_mono - _to_float(cached.get("cached_at"), 0.0) <= cache_ttl_sec
+        ):
+            payload = copy.deepcopy(cached.get("payload") if isinstance(cached.get("payload"), dict) else {})
+            payload["cache"] = "hit"
+            return payload
+
+    def _fetch_chart_rows() -> tuple[List[Dict[str, float]], List[Dict[str, float]]]:
+        fetched_1m = (
             state.candle_store.fetch_recent(timeframe="1m", limit=max_rows, since_ts=since_ts)
             if timeframe_key in {"both", "1m"}
             else []
         )
-        rows_5m = (
+        fetched_5m = (
             state.candle_store.fetch_recent(timeframe="5m", limit=max_rows, since_ts=since_ts)
             if timeframe_key in {"both", "5m"}
             else []
         )
+        return fetched_1m, fetched_5m
+
+    try:
+        rows_1m, rows_5m = await asyncio.to_thread(_fetch_chart_rows)
     except Exception as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"database candles unavailable: {exc}") from exc
     rows_1m = [row for row in rows_1m if _to_int(row.get("timestamp"), 0) <= max_ts]
     rows_5m = [row for row in rows_5m if _to_int(row.get("timestamp"), 0) <= max_ts]
-    return {
+    payload = {
         "analysis_timeframe": str(raw_state_obj.get("analysis_timeframe", "5m")),
         "execution_timeframe": str(raw_state_obj.get("execution_timeframe", "1m")),
         "candles_1m": rows_1m,
         "candles_5m": rows_5m,
         "current_1m": dict(state.current_1m) if state.current_1m else None,
         "last_tick": dict(state.last_tick) if state.last_tick else None,
+        "cache": "miss",
     }
+    with state.market_candle_cache_lock:
+        if len(state.market_candle_cache) > 24:
+            state.market_candle_cache.clear()
+        state.market_candle_cache[cache_key] = {
+            "cached_at": time.monotonic(),
+            "payload": copy.deepcopy(payload),
+        }
+    return payload
 
 
 @app.get("/market/options")
@@ -5641,6 +5708,25 @@ async def paper_trades(
     _require_user(state, _authorization_from_request(authorization, request))
     rows = state.paper_trade.get_trades(limit=limit)
     return {"count": len(rows), "trades": rows}
+
+
+@app.get("/admin/paper/missed-opportunities")
+async def paper_missed_opportunities(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    limit: int = 100,
+) -> Dict[str, Any]:
+    state: AppState = app.state.state
+    _require_admin(state, _authorization_from_request(authorization, request))
+    max_rows = max(1, min(int(limit), 1000))
+    payload = await asyncio.to_thread(state.paper_trade.get_missed_opportunities, limit=max_rows)
+    rows = payload.get("opportunities") if isinstance(payload, dict) else []
+    return {
+        "ok": True,
+        "count": len(rows) if isinstance(rows, list) else 0,
+        "summary": payload.get("summary", {}) if isinstance(payload, dict) else {},
+        "opportunities": rows if isinstance(rows, list) else [],
+    }
 
 
 @app.post("/paper/reset")

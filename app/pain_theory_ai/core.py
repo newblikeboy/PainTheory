@@ -25,7 +25,13 @@ PARTICIPANT_GROUPS = (
     "buyers_both",
 )
 
-MARKET_DIRECTIONS = (
+PAIN_SIDE_LABELS = (
+    "bullish_pain",
+    "bearish_pain",
+    "neutral_pain",
+)
+
+LEGACY_PAIN_SIDE_LABELS = (
     "bullish",
     "bearish",
     "neutral",
@@ -586,9 +592,9 @@ def build_dual_timeframe_features(
 
 def _signal_direction(next_group: str) -> str:
     text = str(next_group or "").strip().lower()
-    if text == "bearish":
+    if text in {"bearish_pain", "bearish"}:
         return "LONG"
-    if text == "bullish":
+    if text in {"bullish_pain", "bullish"}:
         return "SHORT"
     if text in {"put_buyers", "call_sellers"}:
         return "LONG"

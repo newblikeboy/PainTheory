@@ -8,7 +8,8 @@ import joblib
 
 from ..pain_theory_ai.core import (
     GUIDANCE_CHOICES,
-    MARKET_DIRECTIONS,
+    LEGACY_PAIN_SIDE_LABELS,
+    PAIN_SIDE_LABELS,
     PAIN_PHASES,
     PARTICIPANT_GROUPS,
     derive_trade_plan,
@@ -39,10 +40,12 @@ _DIRECTIONAL_NEXT_GROUPS = {
     "put_buyers",
     "call_sellers",
     "put_sellers",
+    "bullish_pain",
+    "bearish_pain",
     "bullish",
     "bearish",
 }
-_SUPPORTED_NEXT_GROUPS = set(MARKET_DIRECTIONS) | _LEGACY_NEXT_GROUPS
+_SUPPORTED_NEXT_GROUPS = set(PAIN_SIDE_LABELS) | set(LEGACY_PAIN_SIDE_LABELS) | _LEGACY_NEXT_GROUPS
 
 
 @dataclass

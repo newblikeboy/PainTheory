@@ -1,6 +1,8 @@
 from .core import (
     FEATURE_COLUMNS,
     GUIDANCE_CHOICES,
+    LEGACY_PAIN_SIDE_LABELS,
+    PAIN_SIDE_LABELS,
     PAIN_PHASES,
     PARTICIPANT_GROUPS,
     build_explanation,
@@ -15,6 +17,8 @@ from .runtime import PainTheoryRuntime
 __all__ = [
     "FEATURE_COLUMNS",
     "GUIDANCE_CHOICES",
+    "LEGACY_PAIN_SIDE_LABELS",
+    "PAIN_SIDE_LABELS",
     "PAIN_PHASES",
     "PARTICIPANT_GROUPS",
     "build_explanation",

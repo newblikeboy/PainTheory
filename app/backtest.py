@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, List, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import Settings, mysql_connect_kwargs_from_parts
+from .pain_theory_ai.timeframes import higher_timeframe_is_available
 from .pain_theory_ai.runtime import PainTheoryRuntime
 from .paper_trade import PaperTradeEngine
 
@@ -859,7 +860,7 @@ class BacktestEngine:
             matched_5m: List[Dict[str, Any]] = []
             while idx_5m < len(candles_5m):
                 c5_ts = _to_int(candles_5m[idx_5m].get("timestamp"), 0)
-                if c5_ts <= candle_ts:
+                if higher_timeframe_is_available(c5_ts, candle_ts):
                     matched_5m.append(candles_5m[idx_5m])
                     idx_5m += 1
                     continue
