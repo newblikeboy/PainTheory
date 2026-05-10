@@ -183,6 +183,9 @@
   let subscribeBusy = false;
   let currentUser = null;
   let reportBusy = false;
+  let liveHomeCache = null;
+  let liveHomeCacheAt = 0;
+  let razorpayLoadPromise = null;
   let lotConfigBusy = false;
   let angelApiBusy = false;
   let angelApiLoadedDate = "";
@@ -265,6 +268,10 @@
 
   function syncTopbarScrollState() {
     document.body.classList.toggle("topbar-scrolled", window.scrollY > 8);
+  }
+
+  function shouldPollNow() {
+    return !document.hidden;
   }
 
   function setActiveView(nextView) {
@@ -513,6 +520,34 @@
     });
   }
 
+  function loadRazorpayCheckout() {
+    if (typeof window.Razorpay === "function") {
+      return Promise.resolve();
+    }
+    if (razorpayLoadPromise) {
+      return razorpayLoadPromise;
+    }
+    razorpayLoadPromise = new Promise(function (resolve, reject) {
+      const existing = document.querySelector('script[data-razorpay-checkout="true"]');
+      if (existing) {
+        existing.addEventListener("load", resolve, { once: true });
+        existing.addEventListener("error", reject, { once: true });
+        return;
+      }
+      const script = document.createElement("script");
+      script.src = "https://checkout.razorpay.com/v1/checkout.js";
+      script.async = true;
+      script.defer = true;
+      script.dataset.razorpayCheckout = "true";
+      script.onload = resolve;
+      script.onerror = function () {
+        reject(new Error("Razorpay checkout failed to load"));
+      };
+      document.head.appendChild(script);
+    });
+    return razorpayLoadPromise;
+  }
+
   function hasReportUi() {
     return Boolean(reportStartDateEl && reportEndDateEl && reportLoadBtn && reportStatusEl && reportCountEl && reportTradesBodyEl);
   }
@@ -525,6 +560,14 @@
       retrainMistakeBodyEl ||
       retrainRefreshBtn
     );
+  }
+
+  function hasCoreStatusUi() {
+    return Boolean(apiStatusEl || streamStatusEl || painPhaseEl || dominantGroupEl || nextGroupEl || guidanceEl || confidenceTextEl || confidenceFillEl);
+  }
+
+  function hasReadyUi() {
+    return Boolean(readyStatusEl || readySummaryEl);
   }
 
   function hasPaperMissedUi() {
@@ -1626,7 +1669,6 @@
       }
       setTerminalLoginConnected(connected);
       setTradingEngineEnabled(engineEnabled);
-      await refreshPaper();
       setText(
         brokerClientIdMsgEl,
         connected
@@ -1788,7 +1830,9 @@
       setSubscriptionStatusFromData(config);
       const savedEnabled = Boolean(config.enabled);
       setTradingEngineEnabled(savedEnabled);
-      await refreshPaper();
+      liveHomeCache = null;
+      liveHomeCacheAt = 0;
+      refreshPaper();
     } catch (err) {
       if (tradingEngineMsgEl) {
         setText(tradingEngineMsgEl, `Trading engine update failed: ${err.message}`);
@@ -1805,14 +1849,15 @@
     }
     const planCode = normalizePlanCode(planCodeOverride || getSelectedPlanCode());
     updateSubscribePlanUi(planCode);
-    if (typeof window.Razorpay !== "function") {
-      setText(subscribeMsgEl, "Razorpay checkout failed to load. Refresh and try again.");
-      return;
-    }
     subscribeBusy = true;
     setSubscribeBusyState(true);
-    setText(subscribeMsgEl, "Creating payment order...");
+    setText(subscribeMsgEl, "Loading checkout...");
     try {
+      await loadRazorpayCheckout();
+      if (typeof window.Razorpay !== "function") {
+        throw new Error("Razorpay checkout failed to load");
+      }
+      setText(subscribeMsgEl, "Creating payment order...");
       const localPlan = SUBSCRIPTION_PLANS[planCode] || SUBSCRIPTION_PLANS.monthly;
       const order = await requestJson("/user/subscription/razorpay/order", {
         method: "POST",
@@ -2296,11 +2341,16 @@
   async function refreshHomeLive() {
     const today = formatTodayIstDate();
     const qs = `start_date=${encodeURIComponent(today)}&end_date=${encodeURIComponent(today)}&mode=live`;
-    const results = await Promise.all([
-      requestJson(`/user/report/ai-trades?${qs}`),
-      requestJson("/paper/state"),
-    ]);
-    renderLiveHomeState(results[0], results[1]);
+    const now = Date.now();
+    const paperPayload = await requestJson("/paper/state");
+    if (liveHomeCache && now - liveHomeCacheAt < 15000) {
+      renderLiveHomeState(liveHomeCache, paperPayload);
+      return;
+    }
+    const reportPayload = await requestJson(`/user/report/ai-trades?${qs}`);
+    liveHomeCache = reportPayload;
+    liveHomeCacheAt = Date.now();
+    renderLiveHomeState(reportPayload, paperPayload);
   }
 
   function renderPaperDiagnostics(diagnosticsRaw) {
@@ -2963,6 +3013,10 @@
     }
     coreBusy = true;
     try {
+      if (!hasCoreStatusUi()) {
+        await refreshPaper();
+        return;
+      }
       const [health, state, raw] = await Promise.all([
         requestJson("/health"),
         requestJson("/state"),
@@ -2982,6 +3036,9 @@
   }
 
   async function refreshReady() {
+    if (!hasReadyUi()) {
+      return;
+    }
     if (readyBusy) {
       return;
     }
@@ -3297,7 +3354,9 @@
       initChart();
     }
     refreshAll();
-    refreshReady();
+    if (hasReadyUi()) {
+      refreshReady();
+    }
     if (hasRetrainUi()) {
       refreshRetrainPanel();
     }
@@ -3307,14 +3366,43 @@
     if (hasFyersUi) {
       refreshFyersStatus();
     }
-    setInterval(refreshAll, 2500);
-    setInterval(refreshReady, 15000);
+    setInterval(function () {
+      if (shouldPollNow()) {
+        refreshAll();
+      }
+    }, document.body.classList.contains("user-console") ? 3500 : 2500);
+    if (hasReadyUi()) {
+      setInterval(function () {
+        if (shouldPollNow()) {
+          refreshReady();
+        }
+      }, 15000);
+    }
     if (hasRetrainUi()) {
-      setInterval(refreshRetrainPanel, 30000);
+      setInterval(function () {
+        if (shouldPollNow()) {
+          refreshRetrainPanel();
+        }
+      }, 30000);
     }
     if (hasChartUi) {
-      setInterval(function () { refreshMarketChart(false); }, 800);
+      setInterval(function () {
+        if (shouldPollNow()) {
+          refreshMarketChart(false);
+        }
+      }, 800);
     }
+    document.addEventListener("visibilitychange", function () {
+      if (!document.hidden) {
+        refreshAll();
+        if (hasReadyUi()) {
+          refreshReady();
+        }
+        if (hasChartUi) {
+          refreshMarketChart(false);
+        }
+      }
+    });
   }
 
   init();

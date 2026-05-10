@@ -5201,7 +5201,7 @@ async def ready(
     authorization: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     state: AppState = app.state.state
-    _require_user(state, _authorization_from_request(authorization, request))
+    await _require_user_async(state, _authorization_from_request(authorization, request))
     return _system_ready_payload(state)
 
 
@@ -5359,7 +5359,7 @@ async def market_candles(
     since: int = 0,
 ) -> Dict[str, Any]:
     state: AppState = app.state.state
-    _require_user(state, _authorization_from_request(authorization, request))
+    await _require_user_async(state, _authorization_from_request(authorization, request))
     max_rows = max(60, min(int(limit), 2000))
     timeframe_key = str(timeframe or "both").strip().lower()
     since_ts = max(0, int(since or 0))
@@ -5423,14 +5423,11 @@ async def market_options(
     limit: int = 300,
 ) -> Dict[str, Any]:
     state: AppState = app.state.state
-    _require_user(state, _authorization_from_request(authorization, request))
+    await _require_user_async(state, _authorization_from_request(authorization, request))
     max_rows = max(20, min(int(limit), 2000))
     max_ts = _max_allowed_timestamp(future_slack_sec=state.settings.max_future_timestamp_sec)
-    rows = [
-        row
-        for row in state.option_store.fetch_recent(limit=max_rows)
-        if _to_int(row.get("timestamp"), 0) <= max_ts
-    ]
+    fetched_rows = await asyncio.to_thread(state.option_store.fetch_recent, limit=max_rows)
+    rows = [row for row in fetched_rows if _to_int(row.get("timestamp"), 0) <= max_ts]
     return {"count": len(rows), "options": rows}
 
 
@@ -5442,15 +5439,15 @@ async def market_option_strikes(
     limit: int = 600,
 ) -> Dict[str, Any]:
     state: AppState = app.state.state
-    _require_user(state, _authorization_from_request(authorization, request))
+    await _require_user_async(state, _authorization_from_request(authorization, request))
     max_rows = max(20, min(int(limit), 5000))
     max_ts = _max_allowed_timestamp(future_slack_sec=state.settings.max_future_timestamp_sec)
     selected_snapshot_id = str(snapshot_id or "").strip()
     if not selected_snapshot_id:
-        latest = state.option_store.fetch_recent(limit=1)
+        latest = await asyncio.to_thread(state.option_store.fetch_recent, limit=1)
         if latest:
             selected_snapshot_id = str(latest[-1].get("snapshot_id") or "").strip()
-    rows = state.option_strike_store.fetch_by_snapshot(selected_snapshot_id, limit=max_rows)
+    rows = await asyncio.to_thread(state.option_strike_store.fetch_by_snapshot, selected_snapshot_id, limit=max_rows)
     rows = [row for row in rows if _to_int(row.get("timestamp"), 0) <= max_ts]
     return {
         "snapshot_id": selected_snapshot_id,
@@ -5702,7 +5699,7 @@ async def paper_state(
     authorization: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     state: AppState = app.state.state
-    _require_user(state, _authorization_from_request(authorization, request))
+    await _require_user_async(state, _authorization_from_request(authorization, request))
     return state.paper_trade.get_state()
 
 
@@ -5713,7 +5710,7 @@ async def paper_trades(
     limit: int = 200,
 ) -> Dict[str, Any]:
     state: AppState = app.state.state
-    _require_user(state, _authorization_from_request(authorization, request))
+    await _require_user_async(state, _authorization_from_request(authorization, request))
     rows = state.paper_trade.get_trades(limit=limit)
     return {"count": len(rows), "trades": rows}
 
@@ -6169,7 +6166,7 @@ async def user_subscription_razorpay_order(
     authorization: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     state: AppState = app.state.state
-    user = _require_user(state, _authorization_from_request(authorization, request))
+    user = await _require_user_async(state, _authorization_from_request(authorization, request))
     key_id = str(state.settings.razorpay_key_id or "").strip()
     key_secret = str(state.settings.razorpay_key_secret or "").strip()
     if not key_id or not key_secret:
@@ -6257,7 +6254,7 @@ async def user_subscription_razorpay_verify(
     authorization: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     state: AppState = app.state.state
-    user = _require_user(state, _authorization_from_request(authorization, request))
+    user = await _require_user_async(state, _authorization_from_request(authorization, request))
     username = str(user.get("email") or user.get("username") or "").strip().lower()
     key_secret = str(state.settings.razorpay_key_secret or "").strip()
     if not key_secret:
@@ -6293,7 +6290,8 @@ async def user_subscription_razorpay_verify(
         plan_name = "Sensible Algo Pro"
     duration_days = max(1, _to_int((selected_plan or {}).get("duration_days"), 30))
     try:
-        subscription = state.user_auth.activate_user_subscription(
+        subscription = await asyncio.to_thread(
+            state.user_auth.activate_user_subscription,
             username=username,
             plan_code=plan_code or "monthly",
             plan_name=plan_name,
@@ -6324,7 +6322,7 @@ async def user_report_trades(
     end_date: str = "",
 ) -> Dict[str, Any]:
     state: AppState = app.state.state
-    user = _require_user(state, _authorization_from_request(authorization, request))
+    user = await _require_user_async(state, _authorization_from_request(authorization, request))
     username = str(user.get("email") or user.get("username") or "").strip().lower()
 
     try:
@@ -6345,7 +6343,7 @@ async def user_report_trades(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"end_date cannot be after {today_ist.isoformat()}.")
 
     try:
-        session = state.user_auth.get_user_angel_session(username)
+        session = await asyncio.to_thread(state.user_auth.get_user_angel_session, username)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     if not bool(session.get("connected")):
@@ -6527,7 +6525,7 @@ async def user_report_ai_trades(
 ) -> Dict[str, Any]:
     """Return AI-generated paper trades and the current user's personal live orders."""
     state: AppState = app.state.state
-    user = _require_user(state, _authorization_from_request(authorization, request))
+    user = await _require_user_async(state, _authorization_from_request(authorization, request))
     username = str(user.get("email") or user.get("username") or "").strip().lower()
     try:
         lot_cfg = await asyncio.to_thread(state.user_auth.get_user_lot_config, username)
