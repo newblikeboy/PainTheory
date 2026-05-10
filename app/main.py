@@ -4822,6 +4822,13 @@ def _require_user(state: AppState, authorization: Optional[str]) -> Dict[str, An
     return user
 
 
+async def _require_user_async(state: AppState, authorization: Optional[str]) -> Dict[str, Any]:
+    user = await asyncio.to_thread(state.user_auth.get_current_user, authorization or "")
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid or expired auth token")
+    return user
+
+
 def _require_admin(state: AppState, authorization: Optional[str]) -> Dict[str, Any]:
     user = _require_user(state, authorization)
     role = str(user.get("role") or "").strip().lower()
@@ -5228,7 +5235,8 @@ async def root() -> Any:
 @app.get("/ui")
 async def ui(request: Request, authorization: Optional[str] = Header(default=None)) -> Any:
     state: AppState = app.state.state
-    if state.user_auth.get_current_user(_authorization_from_request(authorization, request)) is None:
+    user = await asyncio.to_thread(state.user_auth.get_current_user, _authorization_from_request(authorization, request))
+    if user is None:
         return RedirectResponse(url="/", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
     if _FRONTEND_APP.exists():
         return FileResponse(str(_FRONTEND_APP))
@@ -5986,7 +5994,8 @@ async def login(payload: LoginPayload, response: Response) -> Dict[str, Any]:
     if requested_role not in {"user", "admin"}:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="role must be user or admin")
     try:
-        session = state.user_auth.login(
+        session = await asyncio.to_thread(
+            state.user_auth.login,
             email_or_username=identifier,
             password=payload.password,
             required_role=requested_role,
@@ -6012,7 +6021,7 @@ async def auth_me(
     authorization: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     state: AppState = app.state.state
-    user = _require_user(state, _authorization_from_request(authorization, request))
+    user = await _require_user_async(state, _authorization_from_request(authorization, request))
     return {"authenticated": True, "user": user}
 
 
@@ -6022,10 +6031,10 @@ async def user_broker_angel_one(
     authorization: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     state: AppState = app.state.state
-    user = _require_user(state, _authorization_from_request(authorization, request))
+    user = await _require_user_async(state, _authorization_from_request(authorization, request))
     username = str(user.get("email") or user.get("username") or "").strip().lower()
     try:
-        config = state.user_auth.get_user_broker_config(username)
+        config = await asyncio.to_thread(state.user_auth.get_user_broker_config, username)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return {"ok": True, "config": config}
@@ -6038,15 +6047,17 @@ async def user_broker_angel_one_update(
     authorization: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     state: AppState = app.state.state
-    user = _require_user(state, _authorization_from_request(authorization, request))
+    user = await _require_user_async(state, _authorization_from_request(authorization, request))
     username = str(user.get("email") or user.get("username") or "").strip().lower()
     try:
-        config = state.user_auth.set_user_broker_profile(
-            username,
-            client_id=payload.client_id,
-            api_key=payload.api_key,
-            pin=payload.pin,
-            totp_secret=payload.totp_secret,
+        config = await asyncio.to_thread(
+            lambda: state.user_auth.set_user_broker_profile(
+                username,
+                client_id=payload.client_id,
+                api_key=payload.api_key,
+                pin=payload.pin,
+                totp_secret=payload.totp_secret,
+            )
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -6059,16 +6070,16 @@ async def user_broker_angel_one_login(
     authorization: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     state: AppState = app.state.state
-    user = _require_user(state, _authorization_from_request(authorization, request))
+    user = await _require_user_async(state, _authorization_from_request(authorization, request))
     username = str(user.get("email") or user.get("username") or "").strip().lower()
     try:
-        session = state.user_auth.get_user_angel_session(username)
+        session = await asyncio.to_thread(state.user_auth.get_user_angel_session, username)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     try:
         await _login_angel_one_session(state, session, source="manual")
-        config = state.user_auth.get_user_broker_config(username)
+        config = await asyncio.to_thread(state.user_auth.get_user_broker_config, username)
     except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return {"ok": True, "config": config}
@@ -6080,10 +6091,10 @@ async def user_broker_angel_one_disconnect(
     authorization: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     state: AppState = app.state.state
-    user = _require_user(state, _authorization_from_request(authorization, request))
+    user = await _require_user_async(state, _authorization_from_request(authorization, request))
     username = str(user.get("email") or user.get("username") or "").strip().lower()
     try:
-        config = state.user_auth.clear_user_angel_session(username)
+        config = await asyncio.to_thread(state.user_auth.clear_user_angel_session, username)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return {"ok": True, "config": config}
@@ -6095,10 +6106,10 @@ async def user_trading_engine_status(
     authorization: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     state: AppState = app.state.state
-    user = _require_user(state, _authorization_from_request(authorization, request))
+    user = await _require_user_async(state, _authorization_from_request(authorization, request))
     username = str(user.get("email") or user.get("username") or "").strip().lower()
     try:
-        config = state.user_auth.get_user_trading_engine_config(username)
+        config = await asyncio.to_thread(state.user_auth.get_user_trading_engine_config, username)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return {"ok": True, "config": config}
@@ -6111,10 +6122,10 @@ async def user_trading_engine_update(
     authorization: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     state: AppState = app.state.state
-    user = _require_user(state, _authorization_from_request(authorization, request))
+    user = await _require_user_async(state, _authorization_from_request(authorization, request))
     username = str(user.get("email") or user.get("username") or "").strip().lower()
     try:
-        config = state.user_auth.set_user_trading_engine_enabled(username, bool(payload.enabled))
+        config = await asyncio.to_thread(state.user_auth.set_user_trading_engine_enabled, username, bool(payload.enabled))
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return {"ok": True, "config": config}
@@ -6126,7 +6137,7 @@ async def user_lot_config(
     authorization: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     state: AppState = app.state.state
-    user = _require_user(state, _authorization_from_request(authorization, request))
+    user = await _require_user_async(state, _authorization_from_request(authorization, request))
     username = str(user.get("email") or user.get("username") or "").strip().lower()
     try:
         config = await asyncio.to_thread(state.user_auth.get_user_lot_config, username)
@@ -6142,7 +6153,7 @@ async def user_lot_config_update(
     authorization: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     state: AppState = app.state.state
-    user = _require_user(state, _authorization_from_request(authorization, request))
+    user = await _require_user_async(state, _authorization_from_request(authorization, request))
     username = str(user.get("email") or user.get("username") or "").strip().lower()
     try:
         config = await asyncio.to_thread(state.user_auth.set_user_lot_count, username, int(payload.lot_count))
@@ -6637,8 +6648,8 @@ async def auth_logout(
 ) -> Dict[str, Any]:
     state: AppState = app.state.state
     auth_value = _authorization_from_request(authorization, request)
-    user = _require_user(state, auth_value)
-    state.user_auth.logout(auth_value)
+    user = await _require_user_async(state, auth_value)
+    await asyncio.to_thread(state.user_auth.logout, auth_value)
     response.delete_cookie("pta_session")
     return {"ok": True, "username": user.get("username", "")}
 

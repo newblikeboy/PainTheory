@@ -146,6 +146,8 @@ class MySQLUserAuthStore(UserAuthStore):
         self._lock = threading.Lock()
         self._session_cache: Dict[str, Dict[str, Any]] = {}
         self._session_cache_ttl_sec = 8
+        self._last_session_cleanup_at = 0
+        self._session_cleanup_interval_sec = 60
 
         if not self.database or not re.fullmatch(r"[a-zA-Z0-9_]+", self.database):
             raise RuntimeError("AUTH_MYSQL_DATABASE must contain only letters, numbers, and underscores")
@@ -779,12 +781,16 @@ class MySQLUserAuthStore(UserAuthStore):
         return str(value)
 
     def _cleanup_sessions(self, conn: Any) -> None:
+        now = _now()
+        if now - int(self._last_session_cleanup_at) < self._session_cleanup_interval_sec:
+            return
         cur = conn.cursor()
         try:
             cur.execute(
                 "DELETE FROM auth_sessions WHERE expires_at <= %s OR revoked = 1",
-                (_now(),),
+                (now,),
             )
+            self._last_session_cleanup_at = now
         finally:
             cur.close()
 
