@@ -42,6 +42,7 @@ body {
 
 .dashboard-body {
   position: relative;
+  overflow-x: hidden;
 }
 
 .ambient-glow {
@@ -578,8 +579,8 @@ body {
 }
 
 .paper-table {
-  width: 100%;
-  min-width: max-content;
+  width: max-content;
+  min-width: 100%;
   border-collapse: collapse;
   font-size: 0.8rem;
 }

@@ -39,6 +39,7 @@ body.user-console .dashboard-shell {
   margin: 0.85rem auto;
   grid-template-columns: 316px minmax(0, 1fr);
   gap: 1rem;
+  min-width: 0;
 }
 
 body.user-console .mobile-topbar {
@@ -165,6 +166,7 @@ body.user-console .sidebar .ghost-btn:hover {
 
 body.user-console .board-main {
   gap: 1rem;
+  min-width: 0;
 }
 
 body.user-console .card {
@@ -173,6 +175,7 @@ body.user-console .card {
   background: var(--uc-panel);
   backdrop-filter: blur(10px);
   box-shadow: var(--uc-shadow);
+  min-width: 0;
 }
 
 body.user-console .board-header {
@@ -340,22 +343,26 @@ body.user-console .paper-diagnostics .feature {
 }
 
 body.user-console .paper-table-wrap {
+  display: block;
   border: 1px solid rgba(31, 78, 216, 0.16);
   border-radius: 14px;
   background: rgba(255, 255, 255, 0.72);
   overflow-x: auto;
+  overflow-y: hidden;
   width: 100%;
   max-width: 100%;
+  min-width: 0;
   -webkit-overflow-scrolling: touch;
 }
 
 body.user-console .paper-table {
   min-width: 600px;
-  width: 100%;
+  width: max-content;
 }
 
 body.user-console .report-table {
   min-width: 860px;
+  width: max-content;
 }
 
 body.user-console .paper-table th {
@@ -725,11 +732,13 @@ body.user-console .side-nav-btn.is-active {
 
 body.user-console .portal-view {
   display: none;
+  min-width: 0;
 }
 
 body.user-console .portal-view.is-active {
   display: grid;
   gap: 0.9rem;
+  min-width: 0;
 }
 
 body.user-console .home-head {
@@ -757,12 +766,14 @@ body.user-console .home-grid {
   display: grid;
   gap: 0.9rem;
   grid-template-columns: repeat(12, minmax(0, 1fr));
+  min-width: 0;
 }
 
 body.user-console .home-card {
   border-radius: 18px;
   border: 1px solid rgba(67, 114, 202, 0.32);
   background: rgba(255, 255, 255, 0.88);
+  min-width: 0;
 }
 
 body.user-console .home-card h2 {
@@ -785,6 +796,7 @@ body.user-console .active-card {
 
 body.user-console .trades-card {
   grid-column: span 12;
+  min-width: 0;
 }
 
 body.user-console .status-chip {
@@ -958,6 +970,7 @@ body.user-console .compact-table .paper-table td {
 
 body.user-console .view-card {
   padding: 1rem;
+  min-width: 0;
 }
 
 body.user-console .view-card h2 {
@@ -984,6 +997,7 @@ body.user-console .report-grid {
   display: grid;
   gap: 0.72rem;
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  min-width: 0;
 }
 
 body.user-console .report-filter-grid {
@@ -991,6 +1005,7 @@ body.user-console .report-filter-grid {
   display: grid;
   gap: 0.65rem;
   grid-template-columns: repeat(3, minmax(0, 1fr));
+  min-width: 0;
 }
 
 body.user-console .sub-card {

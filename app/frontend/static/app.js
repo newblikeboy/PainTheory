@@ -280,8 +280,13 @@
   }
 
   function savedActiveView() {
+    const hashView = String(window.location.hash || "").replace(/^#/, "").trim().toLowerCase();
+    if (viewExists(hashView)) {
+      return hashView;
+    }
     try {
-      const stored = window.sessionStorage.getItem(ACTIVE_VIEW_STORAGE_KEY);
+      const stored = window.localStorage.getItem(ACTIVE_VIEW_STORAGE_KEY)
+        || window.sessionStorage.getItem(ACTIVE_VIEW_STORAGE_KEY);
       return viewExists(stored) ? String(stored).trim().toLowerCase() : "home";
     } catch (_err) {
       return "home";
@@ -289,10 +294,17 @@
   }
 
   function rememberActiveView(viewName) {
+    const target = viewExists(viewName) ? String(viewName || "home").trim().toLowerCase() : "home";
     try {
-      window.sessionStorage.setItem(ACTIVE_VIEW_STORAGE_KEY, String(viewName || "home"));
+      window.localStorage.setItem(ACTIVE_VIEW_STORAGE_KEY, target);
+      window.sessionStorage.setItem(ACTIVE_VIEW_STORAGE_KEY, target);
     } catch (_err) {
       // Browser storage can be unavailable in private or restricted contexts.
+    }
+    const nextHash = target === "home" ? "" : `#${encodeURIComponent(target)}`;
+    const nextUrl = `${window.location.pathname}${window.location.search}${nextHash}`;
+    if (`${window.location.pathname}${window.location.search}${window.location.hash}` !== nextUrl) {
+      window.history.replaceState(null, "", nextUrl);
     }
   }
 
