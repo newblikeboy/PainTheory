@@ -82,6 +82,7 @@
   const sidebarNavLinks = Array.from(document.querySelectorAll("[data-nav-close]"));
   const viewNavButtons = Array.from(document.querySelectorAll("[data-view-target]"));
   const portalViews = Array.from(document.querySelectorAll("[data-view]"));
+  const ACTIVE_VIEW_STORAGE_KEY = `sensible_algo_active_view:${window.location.pathname}`;
   const profileWrapEl = document.getElementById("profile-wrap");
   const profileToggleBtn = document.getElementById("profile-toggle-btn");
   const profileMenuEl = document.getElementById("profile-menu");
@@ -268,12 +269,37 @@
     return !document.hidden;
   }
 
-  function setActiveView(nextView) {
-    const target = String(nextView || "home").trim().toLowerCase() || "home";
-    let found = portalViews.some(function (viewEl) {
+  function viewExists(viewName) {
+    const target = String(viewName || "").trim().toLowerCase();
+    if (!target) {
+      return false;
+    }
+    return portalViews.some(function (viewEl) {
       return String(viewEl.dataset.view || "").trim().toLowerCase() === target;
     });
-    const finalTarget = found ? target : "home";
+  }
+
+  function savedActiveView() {
+    try {
+      const stored = window.sessionStorage.getItem(ACTIVE_VIEW_STORAGE_KEY);
+      return viewExists(stored) ? String(stored).trim().toLowerCase() : "home";
+    } catch (_err) {
+      return "home";
+    }
+  }
+
+  function rememberActiveView(viewName) {
+    try {
+      window.sessionStorage.setItem(ACTIVE_VIEW_STORAGE_KEY, String(viewName || "home"));
+    } catch (_err) {
+      // Browser storage can be unavailable in private or restricted contexts.
+    }
+  }
+
+  function setActiveView(nextView, options) {
+    const config = options && typeof options === "object" ? options : {};
+    const target = String(nextView || "home").trim().toLowerCase() || "home";
+    const finalTarget = viewExists(target) ? target : "home";
     portalViews.forEach(function (viewEl) {
       const key = String(viewEl.dataset.view || "").trim().toLowerCase();
       const active = key === finalTarget;
@@ -290,6 +316,10 @@
         btn.removeAttribute("aria-current");
       }
     });
+    if (config.remember !== false) {
+      rememberActiveView(finalTarget);
+    }
+    return finalTarget;
   }
 
   function hasBrokerUi() {
@@ -3061,29 +3091,38 @@
       setSidebarOpen(false);
     });
   }
+  function refreshForActiveView(viewTarget) {
+    if (viewTarget === "broker") {
+      refreshBrokerClientId();
+    } else if (viewTarget === "chart") {
+      const cached = cachedMarketPayload(chartTf);
+      if (cached && !chartHistoryLoaded) {
+        renderMarketChart(cached);
+      }
+      refreshMarketChart(!cached);
+    } else if (viewTarget === "lotconfig") {
+      refreshAdminLotSize();
+    } else if (viewTarget === "angelhits") {
+      setAngelApiDefaults();
+      loadAngelApiHits();
+    } else if (viewTarget === "profile") {
+      refreshUserLotConfig();
+    } else if (viewTarget === "report") {
+      setReportDefaults();
+      loadReportTrades();
+    } else if (viewTarget === "backtest") {
+      onBacktestLoadLatest();
+    } else if (viewTarget === "retrain") {
+      refreshRetrainPanel();
+    } else if (viewTarget === "fyers") {
+      refreshFyersStatus();
+    }
+  }
+
   viewNavButtons.forEach(function (btn) {
     btn.addEventListener("click", function () {
-      const viewTarget = String(btn.dataset.viewTarget || "home");
-      setActiveView(viewTarget);
-      if (viewTarget === "broker") {
-        refreshBrokerClientId();
-      } else if (viewTarget === "chart") {
-        const cached = cachedMarketPayload(chartTf);
-        if (cached && !chartHistoryLoaded) {
-          renderMarketChart(cached);
-        }
-        refreshMarketChart(!cached);
-      } else if (viewTarget === "lotconfig") {
-        refreshAdminLotSize();
-      } else if (viewTarget === "angelhits") {
-        setAngelApiDefaults();
-        loadAngelApiHits();
-      } else if (viewTarget === "profile") {
-        refreshUserLotConfig();
-      } else if (viewTarget === "report") {
-        setReportDefaults();
-        loadReportTrades();
-      }
+      const viewTarget = setActiveView(String(btn.dataset.viewTarget || "home"));
+      refreshForActiveView(viewTarget);
     });
   });
   if (profileToggleBtn) {
@@ -3233,7 +3272,7 @@
     setAngelApiDefaults();
     setBacktestProgress(0, "idle");
     setSidebarOpen(false);
-    setActiveView("home");
+    const initialView = setActiveView(savedActiveView(), { remember: false });
     setProfileMenuOpen(false);
     setSubscribeModalOpen(false);
     syncTopbarScrollState();
@@ -3265,6 +3304,7 @@
     if (hasFyersUi) {
       refreshFyersStatus();
     }
+    refreshForActiveView(initialView);
     setInterval(function () {
       if (shouldPollNow()) {
         refreshAll();
