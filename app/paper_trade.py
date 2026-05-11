@@ -107,7 +107,6 @@ class PaperTradeEngine:
         mysql_trades_table: str = "paper_trade_trades",
         mysql_feedback_table: str = "paper_trade_feedback",
         mysql_mistakes_table: str = "paper_trade_mistakes",
-        mysql_missed_table: str = "paper_trade_missed_opportunities",
         storage_backend: str = "mysql",
         model_driven_execution: bool = False,
         option_upnl_exit_points: float = 25.0,
@@ -149,8 +148,6 @@ class PaperTradeEngine:
         self._last_release_ts = 0
         self._pending_release: Optional[Dict[str, Any]] = None
         self._last_option_snapshot: Optional[Dict[str, Any]] = None
-        self._pending_missed: deque[Dict[str, Any]] = deque(maxlen=1000)
-        self._missed_seen: set[str] = set()
         self._db_write_queue: Optional[Queue] = None
         self._db_write_thread: Optional[threading.Thread] = None
         self._db_write_stop = threading.Event()
@@ -184,7 +181,6 @@ class PaperTradeEngine:
         self._mysql_trades_table = str(mysql_trades_table or "paper_trade_trades").strip()
         self._mysql_feedback_table = str(mysql_feedback_table or "paper_trade_feedback").strip()
         self._mysql_mistakes_table = str(mysql_mistakes_table or "paper_trade_mistakes").strip()
-        self._mysql_missed_table = str(mysql_missed_table or "paper_trade_missed_opportunities").strip()
 
         if self._storage_backend == "mysql":
             self._setup_mysql()
@@ -257,7 +253,6 @@ class PaperTradeEngine:
         self._mysql_trades_table = self._validate_identifier(self._mysql_trades_table, "PAPER_TRADE_MYSQL_TRADES_TABLE")
         self._mysql_feedback_table = self._validate_identifier(self._mysql_feedback_table, "PAPER_TRADE_MYSQL_FEEDBACK_TABLE")
         self._mysql_mistakes_table = self._validate_identifier(self._mysql_mistakes_table, "PAPER_TRADE_MYSQL_MISTAKES_TABLE")
-        self._mysql_missed_table = self._validate_identifier(self._mysql_missed_table, "PAPER_TRADE_MYSQL_MISSED_TABLE")
         if not self._mysql_user:
             raise RuntimeError("AUTH_MYSQL_USER is required")
 
@@ -325,8 +320,6 @@ class PaperTradeEngine:
             self._persist_feedback_row_mysql(payload if isinstance(payload, dict) else {})
         elif kind == "mistake":
             self._persist_mistake_row_mysql(payload if isinstance(payload, dict) else {})
-        elif kind == "missed":
-            self._persist_missed_opportunity_mysql(payload if isinstance(payload, dict) else {})
 
     def _initialize_mysql_schema(self) -> None:
         conn = None
@@ -436,36 +429,6 @@ class PaperTradeEngine:
                     INDEX idx_mistake_prediction_ts (prediction_ts),
                     INDEX idx_mistake_entry_ts (entry_ts),
                     INDEX idx_mistake_type (mistake_type)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                """
-            )
-            cur.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS `{self._mysql_missed_table}` (
-                    opportunity_id VARCHAR(80) PRIMARY KEY,
-                    signal_ts BIGINT NOT NULL,
-                    evaluate_after_ts BIGINT NOT NULL,
-                    evaluated_at BIGINT NULL,
-                    direction VARCHAR(16) NOT NULL,
-                    skipped_reason VARCHAR(64) NOT NULL,
-                    skipped_detail VARCHAR(255) NULL,
-                    entry_price DOUBLE NOT NULL DEFAULT 0,
-                    stop_loss_distance DOUBLE NOT NULL DEFAULT 0,
-                    target_level DOUBLE NOT NULL DEFAULT 0,
-                    favorable_points DOUBLE NOT NULL DEFAULT 0,
-                    adverse_points DOUBLE NOT NULL DEFAULT 0,
-                    points DOUBLE NOT NULL DEFAULT 0,
-                    outcome VARCHAR(16) NOT NULL DEFAULT 'pending',
-                    would_hit_target TINYINT(1) NOT NULL DEFAULT 0,
-                    would_hit_stop TINYINT(1) NOT NULL DEFAULT 0,
-                    signal_json LONGTEXT NOT NULL,
-                    features_json LONGTEXT NULL,
-                    created_at BIGINT NOT NULL,
-                    updated_at BIGINT NOT NULL,
-                    INDEX idx_missed_signal_ts (signal_ts),
-                    INDEX idx_missed_evaluate_after (evaluate_after_ts),
-                    INDEX idx_missed_outcome (outcome),
-                    INDEX idx_missed_reason (skipped_reason)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
@@ -1347,213 +1310,6 @@ class PaperTradeEngine:
             if conn is not None:
                 conn.close()
 
-    def _persist_missed_opportunity(self, row: Dict[str, Any]) -> None:
-        self._enqueue_db_write("missed", row)
-
-    def _persist_missed_opportunity_mysql(self, row: Dict[str, Any]) -> None:
-        if self._storage_backend != "mysql":
-            return
-        conn = None
-        cur = None
-        try:
-            conn = self._connect_mysql(with_database=True)
-            cur = conn.cursor()
-            cur.execute(
-                f"""
-                INSERT INTO `{self._mysql_missed_table}` (
-                    opportunity_id,
-                    signal_ts,
-                    evaluate_after_ts,
-                    evaluated_at,
-                    direction,
-                    skipped_reason,
-                    skipped_detail,
-                    entry_price,
-                    stop_loss_distance,
-                    target_level,
-                    favorable_points,
-                    adverse_points,
-                    points,
-                    outcome,
-                    would_hit_target,
-                    would_hit_stop,
-                    signal_json,
-                    features_json,
-                    created_at,
-                    updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE
-                    evaluated_at = VALUES(evaluated_at),
-                    favorable_points = VALUES(favorable_points),
-                    adverse_points = VALUES(adverse_points),
-                    points = VALUES(points),
-                    outcome = VALUES(outcome),
-                    would_hit_target = VALUES(would_hit_target),
-                    would_hit_stop = VALUES(would_hit_stop),
-                    updated_at = VALUES(updated_at)
-                """,
-                (
-                    str(row.get("opportunity_id") or "")[:80],
-                    _to_int(row.get("signal_ts"), 0),
-                    _to_int(row.get("evaluate_after_ts"), 0),
-                    _to_int(row.get("evaluated_at"), 0) or None,
-                    str(row.get("direction") or "")[:16],
-                    str(row.get("skipped_reason") or "")[:64],
-                    str(row.get("skipped_detail") or "")[:255] if row.get("skipped_detail") else None,
-                    _to_float(row.get("entry_price"), 0.0),
-                    _to_float(row.get("stop_loss_distance"), 0.0),
-                    _to_float(row.get("target_level"), 0.0),
-                    _to_float(row.get("favorable_points"), 0.0),
-                    _to_float(row.get("adverse_points"), 0.0),
-                    _to_float(row.get("points"), 0.0),
-                    str(row.get("outcome") or "pending")[:16],
-                    1 if bool(row.get("would_hit_target")) else 0,
-                    1 if bool(row.get("would_hit_stop")) else 0,
-                    json.dumps(row.get("signal") if isinstance(row.get("signal"), dict) else {}, ensure_ascii=True),
-                    json.dumps(row.get("features") if isinstance(row.get("features"), dict) else {}, ensure_ascii=True),
-                    _to_int(row.get("created_at"), int(time.time())),
-                    int(time.time()),
-                ),
-            )
-            conn.commit()
-        except Exception:
-            try:
-                if conn is not None:
-                    conn.rollback()
-            except Exception:
-                pass
-        finally:
-            if cur is not None:
-                cur.close()
-            if conn is not None:
-                conn.close()
-
-    def _record_missed_opportunity(
-        self,
-        *,
-        ts: int,
-        candle: Dict[str, Any],
-        ai_state: Dict[str, Any],
-        direction: str,
-        skipped_reason: str,
-        skipped_detail: str = "",
-        confidence: float = 0.0,
-        guidance: str = "",
-    ) -> None:
-        direction = str(direction or "").strip().upper()
-        if direction not in {"LONG", "SHORT"}:
-            return
-        signal_ts = _to_int(ts, 0)
-        if signal_ts <= 0:
-            return
-        confidence = max(confidence, _to_float(ai_state.get("confidence"), 0.0))
-        confidence = max(confidence, _to_float(ai_state.get("entry_trigger_confidence"), 0.0))
-        guidance_text = str(guidance or ai_state.get("guidance") or "").strip().lower()
-        if confidence < 0.45 and guidance_text != "caution":
-            return
-        dedupe_key = f"{signal_ts}:{direction}:{str(skipped_reason or '').strip().lower()}"
-        if dedupe_key in self._missed_seen:
-            return
-        self._missed_seen.add(dedupe_key)
-        if len(self._missed_seen) > 5000:
-            self._missed_seen = set(list(self._missed_seen)[-2500:])
-
-        entry_price = _to_float(candle.get("close"), self._last_price)
-        if entry_price <= 0.0:
-            return
-        features = ai_state.get("features") if isinstance(ai_state.get("features"), dict) else {}
-        atr = max(0.25, _to_float(features.get("execution_atr_window"), _to_float(features.get("atr_window"), 1.0)))
-        stop_distance = max(0.35, _to_float(ai_state.get("stop_loss_distance"), 0.0))
-        if stop_distance <= 0.35:
-            stop_distance = max(0.35, 0.60 * atr)
-        target_level = max(stop_distance * 1.02, _to_float(ai_state.get("target_level"), 0.0))
-        if target_level <= stop_distance * 1.02:
-            target_level = max(stop_distance * 1.10, 0.90 * atr)
-
-        signal = self._build_release_signal(
-            ts=signal_ts,
-            candle=candle,
-            ai_state=ai_state,
-            option_snapshot=self._last_option_snapshot,
-            direction=direction,
-            confidence=confidence,
-            guidance=guidance_text,
-            compression_bars=self._compression_count,
-        )
-        row = {
-            "opportunity_id": f"missed_{signal_ts}_{direction}_{uuid.uuid4().hex[:10]}",
-            "signal_ts": signal_ts,
-            "evaluate_after_ts": signal_ts + self.hold_seconds,
-            "evaluated_at": 0,
-            "direction": direction,
-            "skipped_reason": str(skipped_reason or "unknown"),
-            "skipped_detail": str(skipped_detail or ""),
-            "entry_price": float(entry_price),
-            "stop_loss_distance": float(stop_distance),
-            "target_level": float(target_level),
-            "favorable_points": 0.0,
-            "adverse_points": 0.0,
-            "points": 0.0,
-            "outcome": "pending",
-            "would_hit_target": False,
-            "would_hit_stop": False,
-            "signal": signal,
-            "features": dict(features),
-            "created_at": signal_ts,
-        }
-        self._pending_missed.append(row)
-        self._persist_missed_opportunity(row)
-
-    def _update_missed_opportunities(self, candle: Dict[str, Any]) -> None:
-        if not self._pending_missed:
-            return
-        ts = _to_int(candle.get("timestamp"), 0)
-        high = _to_float(candle.get("high"), _to_float(candle.get("close"), 0.0))
-        low = _to_float(candle.get("low"), _to_float(candle.get("close"), 0.0))
-        close = _to_float(candle.get("close"), 0.0)
-        remaining: deque[Dict[str, Any]] = deque(maxlen=1000)
-        for item in list(self._pending_missed):
-            direction = str(item.get("direction") or "").upper()
-            entry = _to_float(item.get("entry_price"), 0.0)
-            if entry <= 0.0 or direction not in {"LONG", "SHORT"}:
-                continue
-            if direction == "LONG":
-                favorable = max(0.0, high - entry)
-                adverse = max(0.0, entry - low)
-                final_points = close - entry
-            else:
-                favorable = max(0.0, entry - low)
-                adverse = max(0.0, high - entry)
-                final_points = entry - close
-            item["favorable_points"] = max(_to_float(item.get("favorable_points"), 0.0), favorable)
-            item["adverse_points"] = max(_to_float(item.get("adverse_points"), 0.0), adverse)
-            target_hit = _to_float(item.get("favorable_points"), 0.0) >= _to_float(item.get("target_level"), 0.0)
-            stop_hit = _to_float(item.get("adverse_points"), 0.0) >= _to_float(item.get("stop_loss_distance"), 0.0)
-            evaluate_after = _to_int(item.get("evaluate_after_ts"), 0)
-            if stop_hit:
-                item["outcome"] = "loss"
-                item["points"] = -_to_float(item.get("stop_loss_distance"), 0.0)
-                item["would_hit_stop"] = True
-            elif target_hit:
-                item["outcome"] = "profit"
-                item["points"] = _to_float(item.get("target_level"), 0.0)
-                item["would_hit_target"] = True
-            elif evaluate_after > 0 and ts >= evaluate_after:
-                item["points"] = float(final_points)
-                if final_points > max(0.25, 0.20 * _to_float(item.get("stop_loss_distance"), 1.0)):
-                    item["outcome"] = "profit"
-                elif final_points < -max(0.25, 0.20 * _to_float(item.get("stop_loss_distance"), 1.0)):
-                    item["outcome"] = "loss"
-                else:
-                    item["outcome"] = "flat"
-
-            if str(item.get("outcome") or "pending") == "pending":
-                remaining.append(item)
-                continue
-            item["evaluated_at"] = ts
-            self._persist_missed_opportunity(item)
-        self._pending_missed = remaining
-
     def _record_feedback_from_trade(self, row: Dict[str, Any]) -> None:
         if not self.feedback_enabled:
             return
@@ -2285,7 +2041,6 @@ class PaperTradeEngine:
             self._last_candle_ts = ts
             self._last_price = close_price
             self._push_recent_candle(candle)
-            self._update_missed_opportunities(candle)
             self._note_gate("candles_seen", ts, "candle_processed")
             state_changed = False
 
@@ -2331,48 +2086,18 @@ class PaperTradeEngine:
 
             if self._is_noon_chop(ts):
                 self._note_gate("noon_chop_block", ts, "noon_chop_window")
-                self._record_missed_opportunity(
-                    ts=ts,
-                    candle=candle,
-                    ai_state=ai_state,
-                    direction=direction,
-                    skipped_reason="noon_chop_block",
-                    skipped_detail="noon_chop_window",
-                    confidence=confidence,
-                    guidance=guidance,
-                )
                 if state_changed:
                     self._persist()
                 return self._state_locked()
 
             if guidance == "observe":
                 self._note_gate("guidance_observe_block", ts, "observe_is_non_tradable")
-                self._record_missed_opportunity(
-                    ts=ts,
-                    candle=candle,
-                    ai_state=ai_state,
-                    direction=direction,
-                    skipped_reason="guidance_observe_block",
-                    skipped_detail="observe_is_non_tradable",
-                    confidence=confidence,
-                    guidance=guidance,
-                )
                 if state_changed:
                     self._persist()
                 return self._state_locked()
 
             if self.model_driven_execution and not entry_signal:
                 self._note_gate("entry_signal_off", ts, "model_entry_signal_false")
-                self._record_missed_opportunity(
-                    ts=ts,
-                    candle=candle,
-                    ai_state=ai_state,
-                    direction=direction,
-                    skipped_reason="entry_signal_off",
-                    skipped_detail="model_entry_signal_false",
-                    confidence=trigger_confidence,
-                    guidance=guidance,
-                )
                 if state_changed:
                     self._persist()
                 return self._state_locked()
@@ -2418,33 +2143,12 @@ class PaperTradeEngine:
                     ts,
                     str(feedback_decision.get("reason") or "direction_removed"),
                 )
-                original_direction = str(feedback_decision.get("direction_in") or "").upper()
-                self._record_missed_opportunity(
-                    ts=ts,
-                    candle=candle,
-                    ai_state=ai_state,
-                    direction=original_direction,
-                    skipped_reason="feedback_block",
-                    skipped_detail=str(feedback_decision.get("reason") or "direction_removed"),
-                    confidence=confidence,
-                    guidance=guidance,
-                )
             if confidence < self.min_confidence or not direction:
                 if confidence < self.min_confidence:
                     self._note_gate(
                         "confidence_below_min",
                         ts,
                         f"confidence={confidence:.4f};min={self.min_confidence:.4f}",
-                    )
-                    self._record_missed_opportunity(
-                        ts=ts,
-                        candle=candle,
-                        ai_state=ai_state,
-                        direction=direction,
-                        skipped_reason="confidence_below_min",
-                        skipped_detail=f"confidence={confidence:.4f};min={self.min_confidence:.4f}",
-                        confidence=confidence,
-                        guidance=guidance,
                     )
                 if state_changed:
                     self._persist()
@@ -2662,105 +2366,6 @@ class PaperTradeEngine:
         max_rows = max(1, min(int(limit), 5000))
         with self._lock:
             return [dict(row) for row in self._trades[-max_rows:]]
-
-    def get_missed_opportunities(self, limit: int = 100) -> Dict[str, Any]:
-        max_rows = max(1, min(int(limit), 1000))
-        rows: List[Dict[str, Any]] = []
-        if self._storage_backend == "mysql":
-            conn = None
-            cur = None
-            try:
-                conn = self._connect_mysql(with_database=True)
-                cur = conn.cursor(dictionary=True)
-                cur.execute(
-                    f"""
-                    SELECT
-                        opportunity_id,
-                        signal_ts,
-                        evaluate_after_ts,
-                        evaluated_at,
-                        direction,
-                        skipped_reason,
-                        skipped_detail,
-                        entry_price,
-                        stop_loss_distance,
-                        target_level,
-                        favorable_points,
-                        adverse_points,
-                        points,
-                        outcome,
-                        would_hit_target,
-                        would_hit_stop,
-                        signal_json,
-                        features_json,
-                        created_at,
-                        updated_at
-                    FROM `{self._mysql_missed_table}`
-                    ORDER BY signal_ts DESC
-                    LIMIT %s
-                    """,
-                    (max_rows,),
-                )
-                rows = cur.fetchall() or []
-                conn.commit()
-            finally:
-                if cur is not None:
-                    cur.close()
-                if conn is not None:
-                    conn.close()
-        else:
-            with self._lock:
-                rows = [dict(row) for row in list(self._pending_missed)[-max_rows:]]
-                rows.reverse()
-
-        cleaned: List[Dict[str, Any]] = []
-        summary = {
-            "total": 0,
-            "pending": 0,
-            "profit": 0,
-            "loss": 0,
-            "flat": 0,
-            "missed_profit_points": 0.0,
-            "avoided_loss_points": 0.0,
-        }
-        for row in rows:
-            item = dict(row)
-            for key in ("signal_json", "features_json"):
-                parsed_key = key[:-5]
-                raw = item.get(key)
-                if raw is None and isinstance(item.get(parsed_key), dict):
-                    continue
-                if isinstance(raw, (bytes, bytearray)):
-                    raw = raw.decode("utf-8", errors="ignore")
-                if isinstance(raw, str):
-                    try:
-                        item[parsed_key] = json.loads(raw or "{}")
-                    except Exception:
-                        item[parsed_key] = {}
-                elif isinstance(raw, dict):
-                    item[parsed_key] = dict(raw)
-                else:
-                    item[parsed_key] = {}
-                item.pop(key, None)
-
-            outcome = str(item.get("outcome") or "pending").lower()
-            points = _to_float(item.get("points"), 0.0)
-            summary["total"] = _to_int(summary.get("total"), 0) + 1
-            if outcome == "profit":
-                summary["profit"] = _to_int(summary.get("profit"), 0) + 1
-                summary["missed_profit_points"] = _to_float(summary.get("missed_profit_points"), 0.0) + max(0.0, points)
-            elif outcome == "loss":
-                summary["loss"] = _to_int(summary.get("loss"), 0) + 1
-                summary["avoided_loss_points"] = _to_float(summary.get("avoided_loss_points"), 0.0) + abs(min(0.0, points))
-            elif outcome == "flat":
-                summary["flat"] = _to_int(summary.get("flat"), 0) + 1
-            else:
-                summary["pending"] = _to_int(summary.get("pending"), 0) + 1
-            cleaned.append(item)
-
-        summary["missed_profit_points"] = round(_to_float(summary.get("missed_profit_points"), 0.0), 4)
-        summary["avoided_loss_points"] = round(_to_float(summary.get("avoided_loss_points"), 0.0), 4)
-        return {"summary": summary, "opportunities": cleaned}
 
     def get_mistake_summary(self, *, days: int = 30, max_rows: int = 5000) -> Dict[str, Any]:
         lookback_days = max(1, min(int(days), 365))

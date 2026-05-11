@@ -28,12 +28,6 @@
   const paperTradesBodyEl = document.getElementById("paper-trades-body");
   const paperGateLastEl = document.getElementById("paper-gate-last");
   const paperGateListEl = document.getElementById("paper-gate-list");
-  const paperMissedStatusEl = document.getElementById("paper-missed-status");
-  const paperMissedProfitEl = document.getElementById("paper-missed-profit");
-  const paperMissedLossEl = document.getElementById("paper-missed-loss");
-  const paperMissedPendingEl = document.getElementById("paper-missed-pending");
-  const paperMissedPointsEl = document.getElementById("paper-missed-points");
-  const paperMissedBodyEl = document.getElementById("paper-missed-body");
   const paperResetBtn = document.getElementById("paper-reset-btn");
   const fyersStatusBtn = document.getElementById("fyers-status-btn");
   const fyersUrlBtn = document.getElementById("fyers-url-btn");
@@ -568,17 +562,6 @@
 
   function hasReadyUi() {
     return Boolean(readyStatusEl || readySummaryEl);
-  }
-
-  function hasPaperMissedUi() {
-    return Boolean(
-      paperMissedStatusEl ||
-      paperMissedProfitEl ||
-      paperMissedLossEl ||
-      paperMissedPendingEl ||
-      paperMissedPointsEl ||
-      paperMissedBodyEl
-    );
   }
 
   function formatTodayIstDate() {
@@ -2401,89 +2384,6 @@
     `).join("");
   }
 
-  function missedOutcomeClass(outcomeRaw) {
-    const outcome = String(outcomeRaw || "").toLowerCase();
-    if (outcome === "profit") {
-      return "outcome-win";
-    }
-    if (outcome === "loss") {
-      return "outcome-loss";
-    }
-    if (outcome === "pending") {
-      return "outcome-open";
-    }
-    return "";
-  }
-
-  function renderPaperMissed(payload) {
-    if (!hasPaperMissedUi()) {
-      return;
-    }
-    const data = payload && typeof payload === "object" ? payload : {};
-    const summary = data.summary && typeof data.summary === "object" ? data.summary : {};
-    const rows = Array.isArray(data.opportunities) ? data.opportunities : [];
-    const profit = safeNum(summary.profit, 0);
-    const loss = safeNum(summary.loss, 0);
-    const pending = safeNum(summary.pending, 0);
-    const missedPoints = safeNum(summary.missed_profit_points, 0);
-    setText(paperMissedProfitEl, String(profit));
-    setText(paperMissedLossEl, String(loss));
-    setText(paperMissedPendingEl, String(pending));
-    setText(paperMissedPointsEl, missedPoints.toFixed(2));
-    setText(paperMissedStatusEl, `Rows: ${safeNum(data.count, rows.length)}`);
-    if (!paperMissedBodyEl) {
-      return;
-    }
-    if (!rows.length) {
-      paperMissedBodyEl.innerHTML = '<tr><td colspan="6" class="small">No missed opportunities recorded yet.</td></tr>';
-      return;
-    }
-    paperMissedBodyEl.innerHTML = rows.map(function (row) {
-      const signal = row && typeof row.signal === "object" ? row.signal : {};
-      const pointsRaw = row.points;
-      const points = pointsRaw === null || pointsRaw === undefined
-        ? "--"
-        : safeNum(pointsRaw, 0).toFixed(2);
-      const outcome = String(row.outcome || "pending").toLowerCase();
-      const market = [
-        toLabel(signal.pain_phase || "none"),
-        toLabel(signal.dominant_pain_group || "none"),
-        toLabel(signal.next_likely_pain_group || "none"),
-        toLabel(signal.guidance || "observe"),
-      ].join(" | ");
-      return `<tr>
-        <td>${escapeHtml(formatIst(row.signal_ts))}</td>
-        <td>${escapeHtml(String(row.direction || "--").toUpperCase())}</td>
-        <td>
-          <div>${escapeHtml(toLabel(row.skipped_reason || "unknown"))}</div>
-          <div class="small">${escapeHtml(row.skipped_detail || "")}</div>
-        </td>
-        <td>${escapeHtml(market)}</td>
-        <td>${escapeHtml(points)}</td>
-        <td class="${missedOutcomeClass(outcome)}">${escapeHtml(outcome)}</td>
-      </tr>`;
-    }).join("");
-  }
-
-  async function refreshPaperMissed() {
-    if (!hasPaperMissedUi()) {
-      return;
-    }
-    try {
-      const payload = await requestJson("/admin/paper/missed-opportunities?limit=80");
-      renderPaperMissed(payload);
-    } catch (err) {
-      setText(paperMissedStatusEl, `Load failed: ${err.message}`);
-      setText(paperMissedProfitEl, "0");
-      setText(paperMissedLossEl, "0");
-      setText(paperMissedPendingEl, "0");
-      setText(paperMissedPointsEl, "0.00");
-      if (paperMissedBodyEl) {
-        paperMissedBodyEl.innerHTML = '<tr><td colspan="6" class="small">Missed opportunities unavailable.</td></tr>';
-      }
-    }
-  }
-
   function setBacktestStatus(message) {
     if (backtestStatusEl) {
       backtestStatusEl.textContent = String(message || "");
@@ -2756,7 +2656,6 @@
         const paper = await requestJson("/paper/state");
         renderPaperState(paper);
       }
-      await refreshPaperMissed();
     } catch (_err) {
       if (paperBackendEl) {
         paperBackendEl.textContent = "Backend: unavailable";

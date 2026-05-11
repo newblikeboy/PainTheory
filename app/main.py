@@ -1601,7 +1601,6 @@ class AppState:
             mysql_trades_table=self.settings.paper_trade_mysql_trades_table,
             mysql_feedback_table=self.settings.paper_trade_mysql_feedback_table,
             mysql_mistakes_table=self.settings.paper_trade_mysql_mistakes_table,
-            mysql_missed_table=self.settings.paper_trade_mysql_missed_table,
             model_driven_execution=True,
             option_upnl_exit_points=self.settings.paper_trade_option_upnl_exit_points,
         )
@@ -3600,7 +3599,6 @@ def _db_readiness(state: AppState) -> Dict[str, Any]:
         "paper_trades": settings.paper_trade_mysql_trades_table,
         "paper_feedback": settings.paper_trade_mysql_feedback_table,
         "paper_mistakes": settings.paper_trade_mysql_mistakes_table,
-        "paper_missed": settings.paper_trade_mysql_missed_table,
         "backtest_runs": settings.backtest_mysql_runs_table,
         "backtest_trades": settings.backtest_mysql_trades_table,
     }
@@ -5713,25 +5711,6 @@ async def paper_trades(
     await _require_user_async(state, _authorization_from_request(authorization, request))
     rows = state.paper_trade.get_trades(limit=limit)
     return {"count": len(rows), "trades": rows}
-
-
-@app.get("/admin/paper/missed-opportunities")
-async def paper_missed_opportunities(
-    request: Request,
-    authorization: Optional[str] = Header(default=None),
-    limit: int = 100,
-) -> Dict[str, Any]:
-    state: AppState = app.state.state
-    _require_admin(state, _authorization_from_request(authorization, request))
-    max_rows = max(1, min(int(limit), 1000))
-    payload = await asyncio.to_thread(state.paper_trade.get_missed_opportunities, limit=max_rows)
-    rows = payload.get("opportunities") if isinstance(payload, dict) else []
-    return {
-        "ok": True,
-        "count": len(rows) if isinstance(rows, list) else 0,
-        "summary": payload.get("summary", {}) if isinstance(payload, dict) else {},
-        "opportunities": rows if isinstance(rows, list) else [],
-    }
 
 
 @app.post("/paper/reset")
