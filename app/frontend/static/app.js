@@ -2256,7 +2256,20 @@
     const paper = paperPayload && typeof paperPayload === "object" ? paperPayload : {};
     const qtyMultiplier = getUserQuantityMultiplier();
     const rowsRaw = livePayload && Array.isArray(livePayload.trades) ? livePayload.trades : [];
-    const rows = rowsRaw.slice().sort(function (a, b) {
+    const liveTradeIds = {};
+    rowsRaw.forEach(function (row) {
+      if (String(row && row.mode || "").toLowerCase() !== "live") {
+        return;
+      }
+      const key = toTradeIdKey(row && row.trade_id);
+      if (key) {
+        liveTradeIds[key] = true;
+      }
+    });
+    const rows = rowsRaw.filter(function (row) {
+      const key = toTradeIdKey(row && row.trade_id);
+      return !(String(row && row.mode || "").toLowerCase() === "paper" && key && liveTradeIds[key]);
+    }).sort(function (a, b) {
       return safeNum(b && b.entry_ts, 0) - safeNum(a && a.entry_ts, 0);
     });
     const activeRow = rows.find(function (row) {
@@ -2277,15 +2290,23 @@
         strategyByTradeId[key] = row;
       }
     });
+    function resolveClosedPoints(row) {
+      const key = toTradeIdKey(row && row.trade_id);
+      const linked = strategyByTradeId[key];
+      const linkedPoints = safeNum(linked && linked.points, NaN);
+      if (Number.isFinite(linkedPoints)) {
+        return linkedPoints * qtyMultiplier;
+      }
+      const reportPoints = safeNum(row && row.points, NaN);
+      return Number.isFinite(reportPoints) ? reportPoints : NaN;
+    }
 
     let resolvedCount = 0;
     let profit = 0;
     let loss = 0;
     let net = 0;
     closedRows.forEach(function (row) {
-      const key = toTradeIdKey(row && row.trade_id);
-      const linked = strategyByTradeId[key];
-      const points = safeNum(linked && linked.points, NaN) * qtyMultiplier;
+      const points = resolveClosedPoints(row);
       if (!Number.isFinite(points)) {
         return;
       }
@@ -2336,20 +2357,20 @@
     }
 
     if (!closedRows.length) {
-      paperTradesBodyEl.innerHTML = '<tr><td colspan="7" class="small">No live closed trades for today.</td></tr>';
+      paperTradesBodyEl.innerHTML = '<tr><td colspan="7" class="small">No closed trades for today.</td></tr>';
       return;
     }
 
     paperTradesBodyEl.innerHTML = closedRows.map(function (row) {
       const id = String(row.trade_id || "--");
       const direction = String(row.direction || "--").toUpperCase();
-      const contract = String(row.symbol || "--");
-      const entry = String(row.entry_time_ist || "--");
-      const exit = String(row.exit_time_ist || "--");
       const key = toTradeIdKey(row.trade_id);
       const linked = strategyByTradeId[key];
-      const linkedPoints = safeNum(linked && linked.points, NaN) * qtyMultiplier;
-      const points = Number.isFinite(linkedPoints) ? linkedPoints.toFixed(2) : "--";
+      const contract = linked ? homeOptionLabelFromSignal(linked.signal) : String(row.symbol || "--");
+      const entry = String(row.entry_time_ist || "--");
+      const exit = String(row.exit_time_ist || "--");
+      const resolvedPoints = resolveClosedPoints(row);
+      const points = Number.isFinite(resolvedPoints) ? resolvedPoints.toFixed(2) : "--";
       const outcome = String((linked && linked.outcome) || row.outcome || row.status || "closed");
       return `<tr>
         <td>${id}</td>
@@ -2365,7 +2386,7 @@
 
   async function refreshHomeLive() {
     const today = formatTodayIstDate();
-    const qs = `start_date=${encodeURIComponent(today)}&end_date=${encodeURIComponent(today)}&mode=live`;
+    const qs = `start_date=${encodeURIComponent(today)}&end_date=${encodeURIComponent(today)}&mode=all`;
     const now = Date.now();
     const paperPayload = await requestJson("/paper/state");
     if (liveHomeCache && now - liveHomeCacheAt < 15000) {

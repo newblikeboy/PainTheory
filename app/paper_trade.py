@@ -628,6 +628,7 @@ class PaperTradeEngine:
                     "net_points": net_points,
                     "avg_points": avg_points,
                 }
+            self._persisted_closed_count = len(self._trades)
             conn.commit()
         finally:
             if cur is not None:
@@ -638,7 +639,7 @@ class PaperTradeEngine:
     def _persist(self) -> None:
         if self._storage_backend == "mysql":
             delete_existing = len(self._trades) < self._persisted_closed_count
-            trade_rows = self._trades if delete_existing else self._trades[self._persisted_closed_count :]
+            trade_rows = self._trades
             snapshot = {
                 "trades": copy.deepcopy(trade_rows),
                 "active_trade": copy.deepcopy(self._active_trade),
