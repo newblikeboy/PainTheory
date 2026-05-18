@@ -11,6 +11,8 @@ except ImportError:  # pragma: no cover - optional dependency
 
 logger = logging.getLogger(__name__)
 
+SOCKET_CLOSE_RECONNECT_GRACE_SEC = 15.0
+
 
 def _to_float(value: Any) -> Optional[float]:
     if value is None:
@@ -95,6 +97,9 @@ class FyersTickStream:
         self._last_volume: Optional[float] = None
         self._fatal_error: str = ""
         self._fatal_lock = threading.Lock()
+        self._closed_at: Optional[float] = None
+        self._closed_message: str = ""
+        self._close_lock = threading.Lock()
 
     @staticmethod
     def _normalize_data_type(value: str) -> str:
@@ -122,6 +127,10 @@ class FyersTickStream:
             try:
                 tick = await asyncio.wait_for(self.queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
+                close_message = self._get_stale_close_message()
+                if close_message:
+                    self._close_socket()
+                    raise RuntimeError(close_message)
                 continue
             await handler(tick)
 
@@ -142,10 +151,12 @@ class FyersTickStream:
     def _onopen(self) -> None:
         if self._socket is None:
             return
+        self._clear_close_state()
         self._socket.subscribe(symbols=[self.symbol], data_type=self.data_type)
         self._socket.keep_running()
 
     def _onmessage(self, message: Any) -> None:
+        self._clear_close_state()
         ticks = message if isinstance(message, list) else [message]
         for item in ticks:
             tick = self._parse_message(item)
@@ -159,6 +170,7 @@ class FyersTickStream:
 
     def _onclose(self, message: Any) -> None:
         logger.warning("Fyers socket closed: %s", message)
+        self._set_close_state(message)
         if _is_auth_error(message):
             self._set_fatal_error(f"FYERS auth close: {_message_text(message)}")
 
@@ -173,6 +185,27 @@ class FyersTickStream:
     def _get_fatal_error(self) -> str:
         with self._fatal_lock:
             return self._fatal_error
+
+    def _set_close_state(self, message: Any) -> None:
+        with self._close_lock:
+            self._closed_at = time.monotonic()
+            self._closed_message = _message_text(message)
+
+    def _clear_close_state(self) -> None:
+        with self._close_lock:
+            self._closed_at = None
+            self._closed_message = ""
+
+    def _get_stale_close_message(self) -> str:
+        with self._close_lock:
+            closed_at = self._closed_at
+            closed_message = self._closed_message
+        if closed_at is None:
+            return ""
+        if time.monotonic() - closed_at < SOCKET_CLOSE_RECONNECT_GRACE_SEC:
+            return ""
+        detail = f": {closed_message}" if closed_message else ""
+        return f"FYERS socket closed and did not reconnect within {SOCKET_CLOSE_RECONNECT_GRACE_SEC:.0f}s{detail}"
 
     def _close_socket(self) -> None:
         if self._socket is None:
