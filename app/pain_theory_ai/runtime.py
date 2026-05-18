@@ -5,7 +5,7 @@ from typing import Any, Deque, Dict, List, Optional
 
 from ..ml.pain_theory_model import PainTheoryModelBundle, load_pain_theory_model, predict_pain_theory
 from .core import (
-    FEATURE_COLUMNS,
+    ai_feature_columns,
     build_explanation,
     build_dual_timeframe_features,
     classify_from_rules,
@@ -257,13 +257,12 @@ class PainTheoryRuntime:
         latest_ts = int(analysis_candles[-1]["timestamp"])
         analysis_window = self._tail_rows(analysis_candles, 30)
         execution_window = self._tail_rows(self.candles, 30)
-        option_window_analysis = self._recent_options_for(latest_ts, limit=90 if self.use_5m_primary else 30)
-        option_window_execution = self._recent_options_for(latest_ts, limit=30)
+        # Option snapshots are still stored for the rest of the app, but the AI model
+        # is intentionally market-candle-only.
         features = build_dual_timeframe_features(
             analysis_window,
             execution_window,
-            analysis_options=option_window_analysis,
-            execution_options=option_window_execution,
+            include_options=False,
         )
 
         if self.model is not None:
@@ -345,7 +344,7 @@ class PainTheoryRuntime:
             "recommended_stop_loss": recommended_stop_loss,
             "recommended_targets": recommended_targets,
             "explanation": explanation,
-            "features": {key: float(features.get(key, 0.0)) for key in FEATURE_COLUMNS},
+            "features": {key: float(features.get(key, 0.0)) for key in ai_feature_columns()},
             "analysis_timeframe": "5m" if self.use_5m_primary else "1m",
             "execution_timeframe": "1m",
             "analysis_context": analysis_context,

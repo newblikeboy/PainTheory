@@ -54,6 +54,32 @@ FEATURE_COLUMNS = [
     "shock_move",
     "liquidity_sweep",
     "trap_event",
+    "market_structure_trend",
+    "market_structure_strength",
+    "swing_high_state",
+    "swing_low_state",
+    "accepted_high_break",
+    "accepted_low_break",
+    "failed_high_break",
+    "failed_low_break",
+    "swing_range_position",
+    "demand_zone_low",
+    "demand_zone_high",
+    "supply_zone_low",
+    "supply_zone_high",
+    "demand_zone_age",
+    "supply_zone_age",
+    "demand_zone_touches",
+    "supply_zone_touches",
+    "price_in_demand_zone",
+    "price_in_supply_zone",
+    "breakout_from_demand",
+    "breakdown_from_supply",
+    "failed_break_above_supply",
+    "failed_break_below_demand",
+    "retest_acceptance",
+    "distance_to_demand_zone",
+    "distance_to_supply_zone",
     "premium_velocity_ce",
     "premium_velocity_pe",
     "premium_decay_rate_ce",
@@ -77,12 +103,38 @@ FEATURE_COLUMNS = [
     "gamma_risk",
 ]
 
+OPTION_SNAPSHOT_FEATURE_COLUMNS = {
+    "premium_velocity_ce",
+    "premium_velocity_pe",
+    "premium_decay_rate_ce",
+    "premium_decay_rate_pe",
+    "volume_burst_ce",
+    "volume_burst_pe",
+    "oi_change_pressure_ce",
+    "oi_change_pressure_pe",
+    "band_concentration",
+    "magnet_distance",
+    "oi_concentration",
+    "option_skew_balance",
+    "atm_ltp_skew",
+    "atm_volume_skew",
+    "atm_oi_skew",
+    "option_flow_strength",
+    "option_signal_consistency",
+    "option_data_quality",
+}
 
-def dual_feature_columns(include_base: bool = True) -> List[str]:
+
+def ai_feature_columns() -> List[str]:
+    return [key for key in FEATURE_COLUMNS if key not in OPTION_SNAPSHOT_FEATURE_COLUMNS]
+
+
+def dual_feature_columns(include_base: bool = True, include_options: bool = True) -> List[str]:
+    base_columns = FEATURE_COLUMNS if include_options else ai_feature_columns()
     columns: List[str] = []
     if include_base:
-        columns.extend(FEATURE_COLUMNS)
-    for key in FEATURE_COLUMNS:
+        columns.extend(base_columns)
+    for key in base_columns:
         columns.append(f"analysis_{key}")
         columns.append(f"execution_{key}")
         columns.append(f"delta_{key}")
@@ -92,12 +144,13 @@ def dual_feature_columns(include_base: bool = True) -> List[str]:
             "tf_speed_ratio",
             "tf_range_ratio",
             "tf_overlap_ratio",
-            "tf_premium_balance",
             "tf_atr_ratio",
             "tf_regime_shift",
             "tf_gamma_ratio",
         ]
     )
+    if include_options:
+        columns.append("tf_premium_balance")
     return columns
 
 
@@ -210,6 +263,255 @@ def _direction(candle: Dict[str, Any]) -> int:
     if close < open_:
         return -1
     return 0
+
+
+def _confirmed_swings(
+    candles: List[Dict[str, Any]],
+    *,
+    left: int = 2,
+    right: int = 2,
+) -> tuple[List[tuple[int, float]], List[tuple[int, float]]]:
+    highs: List[tuple[int, float]] = []
+    lows: List[tuple[int, float]] = []
+    if len(candles) < left + right + 1:
+        return highs, lows
+    last_confirmed = len(candles) - right - 1
+    for idx in range(left, last_confirmed + 1):
+        row = candles[idx]
+        high = _value(row, "high")
+        low = _value(row, "low")
+        left_rows = candles[idx - left : idx]
+        right_rows = candles[idx + 1 : idx + 1 + right]
+        left_highs = [_value(item, "high") for item in left_rows]
+        right_highs = [_value(item, "high") for item in right_rows]
+        left_lows = [_value(item, "low") for item in left_rows]
+        right_lows = [_value(item, "low") for item in right_rows]
+        if high >= max(left_highs + right_highs) and high > min(left_highs + right_highs):
+            highs.append((idx, high))
+        if low <= min(left_lows + right_lows) and low < max(left_lows + right_lows):
+            lows.append((idx, low))
+    return highs, lows
+
+
+def _market_structure_features(window: List[Dict[str, Any]], current: Dict[str, Any]) -> Dict[str, float]:
+    highs, lows = _confirmed_swings(window)
+    close = _value(current, "close")
+    current_high = _value(current, "high")
+    current_low = _value(current, "low")
+
+    swing_high_state = 0.0
+    swing_low_state = 0.0
+    if len(highs) >= 2:
+        swing_high_state = float(_sign(highs[-1][1] - highs[-2][1], eps=1e-6))
+    if len(lows) >= 2:
+        swing_low_state = float(_sign(lows[-1][1] - lows[-2][1], eps=1e-6))
+
+    last_high = highs[-1][1] if highs else 0.0
+    last_low = lows[-1][1] if lows else 0.0
+    accepted_high_break = 1.0 if last_high > 0.0 and current_high > last_high and close > last_high else 0.0
+    accepted_low_break = 1.0 if last_low > 0.0 and current_low < last_low and close < last_low else 0.0
+    failed_high_break = 1.0 if last_high > 0.0 and current_high > last_high and close <= last_high else 0.0
+    failed_low_break = 1.0 if last_low > 0.0 and current_low < last_low and close >= last_low else 0.0
+
+    trend = 0.0
+    if swing_high_state > 0.0 and swing_low_state > 0.0:
+        trend = 1.0
+    elif swing_high_state < 0.0 and swing_low_state < 0.0:
+        trend = -1.0
+    elif accepted_high_break > 0.0 and swing_low_state >= 0.0:
+        trend = 1.0
+    elif accepted_low_break > 0.0 and swing_high_state <= 0.0:
+        trend = -1.0
+
+    strength = 0.0
+    if trend != 0.0:
+        matching_parts = 0
+        if (trend > 0.0 and swing_high_state > 0.0) or (trend < 0.0 and swing_high_state < 0.0):
+            matching_parts += 1
+        if (trend > 0.0 and swing_low_state > 0.0) or (trend < 0.0 and swing_low_state < 0.0):
+            matching_parts += 1
+        if (trend > 0.0 and accepted_high_break > 0.0) or (trend < 0.0 and accepted_low_break > 0.0):
+            matching_parts += 1
+        strength = _clamp(0.35 + (0.22 * matching_parts), 0.0, 1.0)
+
+    range_position = 0.5
+    if last_high > last_low > 0.0:
+        range_position = _clamp(_safe_div(close - last_low, last_high - last_low), 0.0, 1.0)
+
+    return {
+        "market_structure_trend": trend,
+        "market_structure_strength": strength,
+        "swing_high_state": swing_high_state,
+        "swing_low_state": swing_low_state,
+        "accepted_high_break": accepted_high_break,
+        "accepted_low_break": accepted_low_break,
+        "failed_high_break": failed_high_break,
+        "failed_low_break": failed_low_break,
+        "swing_range_position": range_position,
+    }
+
+
+def _zone_bounds(candle: Dict[str, Any], kind: str, atr: float) -> tuple[float, float]:
+    open_ = _value(candle, "open")
+    close = _value(candle, "close")
+    high = _value(candle, "high")
+    low = _value(candle, "low")
+    body_low = min(open_, close)
+    body_high = max(open_, close)
+    zone_pad = max(atr * 0.15, 1e-6)
+    zone_cap = max(atr * 1.10, zone_pad)
+
+    if kind == "demand":
+        zone_low = low
+        zone_high = max(body_high, low + zone_pad)
+        zone_high = min(zone_high, low + zone_cap)
+    else:
+        zone_high = high
+        zone_low = min(body_low, high - zone_pad)
+        zone_low = max(zone_low, high - zone_cap)
+
+    if zone_high <= zone_low:
+        midpoint = (zone_high + zone_low) / 2.0
+        zone_low = midpoint - (zone_pad / 2.0)
+        zone_high = midpoint + (zone_pad / 2.0)
+    return float(zone_low), float(zone_high)
+
+
+def _zone_touched(candle: Dict[str, Any], zone_low: float, zone_high: float) -> bool:
+    return _value(candle, "low") <= zone_high and _value(candle, "high") >= zone_low
+
+
+def _select_active_zone(
+    window: List[Dict[str, Any]],
+    swings: List[tuple[int, float]],
+    *,
+    kind: str,
+    atr: float,
+) -> Dict[str, float] | None:
+    invalidation_pad = max(atr * 0.15, 1e-6)
+    for swing_idx, _price in reversed(swings):
+        if swing_idx < 0 or swing_idx >= len(window):
+            continue
+        zone_low, zone_high = _zone_bounds(window[swing_idx], kind, atr)
+        later = window[swing_idx + 1 :]
+        if kind == "demand":
+            invalidated = any(_value(row, "close") < zone_low - invalidation_pad for row in later)
+        else:
+            invalidated = any(_value(row, "close") > zone_high + invalidation_pad for row in later)
+        if invalidated:
+            continue
+        touches = sum(1 for row in later if _zone_touched(row, zone_low, zone_high))
+        return {
+            "low": zone_low,
+            "high": zone_high,
+            "age": float(len(window) - 1 - swing_idx),
+            "touches": float(touches),
+        }
+    return None
+
+
+def _distance_to_zone(close: float, zone_low: float, zone_high: float, atr: float, *, kind: str) -> float:
+    if zone_low <= close <= zone_high:
+        return 0.0
+    denom = max(atr, 1e-9)
+    if kind == "demand":
+        if close > zone_high:
+            return _clamp((close - zone_high) / denom, -10.0, 10.0)
+        return _clamp((close - zone_low) / denom, -10.0, 10.0)
+    if close < zone_low:
+        return _clamp((zone_low - close) / denom, -10.0, 10.0)
+    return _clamp((zone_high - close) / denom, -10.0, 10.0)
+
+
+def _demand_supply_zone_features(
+    window: List[Dict[str, Any]],
+    current: Dict[str, Any],
+    *,
+    atr: float,
+    structure: Dict[str, float],
+) -> Dict[str, float]:
+    highs, lows = _confirmed_swings(window)
+    demand = _select_active_zone(window, lows, kind="demand", atr=atr)
+    supply = _select_active_zone(window, highs, kind="supply", atr=atr)
+
+    close = _value(current, "close")
+    current_direction = float(_direction(current))
+    expansion = _safe_div(max(0.0, _value(current, "high") - _value(current, "low")), max(atr, 1e-9))
+    accepted_high_break = float(structure.get("accepted_high_break", 0.0)) >= 0.5
+    accepted_low_break = float(structure.get("accepted_low_break", 0.0)) >= 0.5
+    structure_trend = float(structure.get("market_structure_trend", 0.0))
+
+    features = {
+        "demand_zone_low": 0.0,
+        "demand_zone_high": 0.0,
+        "supply_zone_low": 0.0,
+        "supply_zone_high": 0.0,
+        "demand_zone_age": 0.0,
+        "supply_zone_age": 0.0,
+        "demand_zone_touches": 0.0,
+        "supply_zone_touches": 0.0,
+        "price_in_demand_zone": 0.0,
+        "price_in_supply_zone": 0.0,
+        "breakout_from_demand": 0.0,
+        "breakdown_from_supply": 0.0,
+        "failed_break_above_supply": 0.0,
+        "failed_break_below_demand": 0.0,
+        "retest_acceptance": 0.0,
+        "distance_to_demand_zone": 0.0,
+        "distance_to_supply_zone": 0.0,
+    }
+
+    demand_recent = False
+    if demand is not None:
+        demand_low = demand["low"]
+        demand_high = demand["high"]
+        features["demand_zone_low"] = demand_low
+        features["demand_zone_high"] = demand_high
+        features["demand_zone_age"] = demand["age"]
+        features["demand_zone_touches"] = demand["touches"]
+        features["price_in_demand_zone"] = 1.0 if _zone_touched(current, demand_low, demand_high) else 0.0
+        features["distance_to_demand_zone"] = _distance_to_zone(close, demand_low, demand_high, atr, kind="demand")
+        demand_recent = any(_zone_touched(row, demand_low, demand_high) for row in window[-5:])
+        failed_below = _value(current, "low") < demand_low and close >= demand_low
+        features["failed_break_below_demand"] = 1.0 if failed_below else 0.0
+        breakout = (
+            demand_recent
+            and close > demand_high
+            and current_direction >= 0.0
+            and (accepted_high_break or structure_trend >= 0.0)
+            and expansion >= 0.75
+        )
+        features["breakout_from_demand"] = 1.0 if breakout else 0.0
+        if features["price_in_demand_zone"] > 0.0 and close > demand_high and current_direction >= 0.0:
+            features["retest_acceptance"] = 1.0
+
+    supply_recent = False
+    if supply is not None:
+        supply_low = supply["low"]
+        supply_high = supply["high"]
+        features["supply_zone_low"] = supply_low
+        features["supply_zone_high"] = supply_high
+        features["supply_zone_age"] = supply["age"]
+        features["supply_zone_touches"] = supply["touches"]
+        features["price_in_supply_zone"] = 1.0 if _zone_touched(current, supply_low, supply_high) else 0.0
+        features["distance_to_supply_zone"] = _distance_to_zone(close, supply_low, supply_high, atr, kind="supply")
+        supply_recent = any(_zone_touched(row, supply_low, supply_high) for row in window[-5:])
+        failed_above = _value(current, "high") > supply_high and close <= supply_high
+        features["failed_break_above_supply"] = 1.0 if failed_above else 0.0
+        breakdown = (
+            supply_recent
+            and close < supply_low
+            and current_direction <= 0.0
+            and (accepted_low_break or structure_trend <= 0.0)
+            and expansion >= 0.75
+        )
+        features["breakdown_from_supply"] = 1.0 if breakdown else 0.0
+        if features["price_in_supply_zone"] > 0.0 and close < supply_low and current_direction <= 0.0:
+            features["retest_acceptance"] = -1.0
+
+    if demand_recent and supply_recent:
+        features["retest_acceptance"] = 0.0
+    return features
 
 
 def _option_snapshot(raw: Dict[str, Any], spot_price: float) -> Dict[str, float]:
@@ -377,6 +679,8 @@ def build_features(
     sweep_low = _value(current, "low") < prior_low and _value(current, "close") > prior_low
     liquidity_sweep = 1.0 if (sweep_high or sweep_low) else 0.0
     trap_event = 1.0 if (liquidity_sweep > 0.0 and current_direction != 0 and current_direction != prev_direction) else 0.0
+    structure = _market_structure_features(window, current)
+    zones = _demand_supply_zone_features(window, current, atr=median_range, structure=structure)
 
     trend_score = (
         (_safe_div(float(consecutive), 6.0))
@@ -404,6 +708,32 @@ def build_features(
         "shock_move": shock_move,
         "liquidity_sweep": liquidity_sweep,
         "trap_event": trap_event,
+        "market_structure_trend": structure["market_structure_trend"],
+        "market_structure_strength": structure["market_structure_strength"],
+        "swing_high_state": structure["swing_high_state"],
+        "swing_low_state": structure["swing_low_state"],
+        "accepted_high_break": structure["accepted_high_break"],
+        "accepted_low_break": structure["accepted_low_break"],
+        "failed_high_break": structure["failed_high_break"],
+        "failed_low_break": structure["failed_low_break"],
+        "swing_range_position": structure["swing_range_position"],
+        "demand_zone_low": zones["demand_zone_low"],
+        "demand_zone_high": zones["demand_zone_high"],
+        "supply_zone_low": zones["supply_zone_low"],
+        "supply_zone_high": zones["supply_zone_high"],
+        "demand_zone_age": zones["demand_zone_age"],
+        "supply_zone_age": zones["supply_zone_age"],
+        "demand_zone_touches": zones["demand_zone_touches"],
+        "supply_zone_touches": zones["supply_zone_touches"],
+        "price_in_demand_zone": zones["price_in_demand_zone"],
+        "price_in_supply_zone": zones["price_in_supply_zone"],
+        "breakout_from_demand": zones["breakout_from_demand"],
+        "breakdown_from_supply": zones["breakdown_from_supply"],
+        "failed_break_above_supply": zones["failed_break_above_supply"],
+        "failed_break_below_demand": zones["failed_break_below_demand"],
+        "retest_acceptance": zones["retest_acceptance"],
+        "distance_to_demand_zone": zones["distance_to_demand_zone"],
+        "distance_to_supply_zone": zones["distance_to_supply_zone"],
         "premium_velocity_ce": 0.0,
         "premium_velocity_pe": 0.0,
         "premium_decay_rate_ce": 0.0,
@@ -540,12 +870,14 @@ def build_dual_timeframe_features(
     *,
     analysis_options: List[Dict[str, Any]] | None = None,
     execution_options: List[Dict[str, Any]] | None = None,
+    include_options: bool = True,
 ) -> Dict[str, float]:
-    analysis = build_features(analysis_candles, analysis_options)
-    execution = build_features(execution_candles, execution_options)
-    merged: Dict[str, float] = {key: float(analysis.get(key, 0.0)) for key in FEATURE_COLUMNS}
+    analysis = build_features(analysis_candles, analysis_options if include_options else None)
+    execution = build_features(execution_candles, execution_options if include_options else None)
+    base_columns = FEATURE_COLUMNS if include_options else ai_feature_columns()
+    merged: Dict[str, float] = {key: float(analysis.get(key, 0.0)) for key in base_columns}
 
-    for key in FEATURE_COLUMNS:
+    for key in base_columns:
         analysis_value = float(analysis.get(key, 0.0))
         execution_value = float(execution.get(key, 0.0))
         merged[f"analysis_{key}"] = analysis_value
@@ -572,10 +904,11 @@ def build_dual_timeframe_features(
         float(execution.get("overlap_ratio", 0.0)),
         max(1e-9, abs(float(analysis.get("overlap_ratio", 0.0)))),
     )
-    merged["tf_premium_balance"] = (
-        (float(execution.get("premium_velocity_pe", 0.0)) - float(execution.get("premium_velocity_ce", 0.0)))
-        - (float(analysis.get("premium_velocity_pe", 0.0)) - float(analysis.get("premium_velocity_ce", 0.0)))
-    )
+    if include_options:
+        merged["tf_premium_balance"] = (
+            (float(execution.get("premium_velocity_pe", 0.0)) - float(execution.get("premium_velocity_ce", 0.0)))
+            - (float(analysis.get("premium_velocity_pe", 0.0)) - float(analysis.get("premium_velocity_ce", 0.0)))
+        )
     merged["tf_atr_ratio"] = _safe_div(
         float(execution.get("atr_window", 0.0)),
         max(1e-9, float(analysis.get("atr_window", 0.0))),
@@ -616,16 +949,39 @@ def derive_trade_plan(
     compression = max(0.0, float(features.get("compression_regime", 0.0)))
     shock = max(0.0, float(features.get("shock_move", 0.0)))
     trend = abs(float(features.get("regime_trend_score", 0.0)))
+    structure_trend = float(features.get("market_structure_trend", 0.0))
+    structure_strength = max(0.0, float(features.get("market_structure_strength", 0.0)))
+    failed_high_break = float(features.get("failed_high_break", 0.0)) >= 0.5
+    failed_low_break = float(features.get("failed_low_break", 0.0)) >= 0.5
+    zone_rejection_context = bool(
+        float(features.get("trap_event", 0.0)) >= 0.5
+        or float(features.get("direction_flip", 0.0)) >= 0.5
+        or float(features.get("wick_dominance", 0.0)) >= 0.55
+    )
+    failed_above_supply = bool(
+        float(features.get("failed_break_above_supply", 0.0)) >= 0.5
+        and (failed_high_break or zone_rejection_context)
+    )
+    failed_below_demand = bool(
+        float(features.get("failed_break_below_demand", 0.0)) >= 0.5
+        and (failed_low_break or zone_rejection_context)
+    )
     gamma = max(0.0, float(features.get("gamma_risk", 0.0)))
 
     stop_loss_distance = max(0.35, atr * (0.55 + (0.28 * compression) + (0.12 * gamma)))
-    target_multiple = 1.20 + min(0.9, (0.7 * shock) + (0.12 * trend) - (0.18 * compression))
+    target_multiple = 1.20 + min(0.9, (0.7 * shock) + (0.12 * trend) + (0.16 * structure_strength) - (0.18 * compression))
     target_level = max(stop_loss_distance * 1.05, stop_loss_distance * target_multiple)
+
+    trend_counter = bool(
+        (direction == "LONG" and structure_trend < 0.0 and not failed_low_break and not failed_below_demand)
+        or (direction == "SHORT" and structure_trend > 0.0 and not failed_high_break and not failed_above_supply)
+    )
 
     entry_signal = bool(
         direction != "NONE"
         and guidance in {"caution"}
         and float(confidence) >= 0.53
+        and not trend_counter
         and not (pain_phase in {"digestion", "exhaustion_pain", "expiry_pain"} and guidance == "wait")
     )
     if compression >= 1.6 and shock <= 0.2:
@@ -659,6 +1015,19 @@ def classify_from_rules(
     shock = float(features.get("shock_move", 0.0))
     sweep = float(features.get("liquidity_sweep", 0.0))
     trap = float(features.get("trap_event", 0.0))
+    structure_trend = float(features.get("market_structure_trend", 0.0))
+    structure_strength = float(features.get("market_structure_strength", 0.0))
+    swing_high_state = float(features.get("swing_high_state", 0.0))
+    swing_low_state = float(features.get("swing_low_state", 0.0))
+    accepted_high_break = float(features.get("accepted_high_break", 0.0)) >= 0.5
+    accepted_low_break = float(features.get("accepted_low_break", 0.0)) >= 0.5
+    failed_high_break = float(features.get("failed_high_break", 0.0)) >= 0.5
+    failed_low_break = float(features.get("failed_low_break", 0.0)) >= 0.5
+    breakout_from_demand = float(features.get("breakout_from_demand", 0.0)) >= 0.5
+    breakdown_from_supply = float(features.get("breakdown_from_supply", 0.0)) >= 0.5
+    failed_above_supply = float(features.get("failed_break_above_supply", 0.0)) >= 0.5
+    failed_below_demand = float(features.get("failed_break_below_demand", 0.0)) >= 0.5
+    retest_acceptance = float(features.get("retest_acceptance", 0.0))
     option_skew = float(features.get("option_skew_balance", 0.0))
     atm_ltp_skew = float(features.get("atm_ltp_skew", 0.0))
     atm_volume_skew = float(features.get("atm_volume_skew", 0.0))
@@ -675,19 +1044,37 @@ def classify_from_rules(
         + (0.08 * atm_volume_skew)
     )
     option_usable = bool(option_data_quality >= 0.28 and option_flow_strength >= 0.20)
+    zone_failed_rejection = bool(
+        (failed_above_supply or failed_below_demand)
+        and (failed_high_break or failed_low_break or trap >= 0.5 or flip or wick >= 0.55 or expansion >= 1.10)
+    )
+    zone_breakout_acceptance = bool(
+        (breakout_from_demand or breakdown_from_supply or abs(retest_acceptance) > 0.0)
+        and (expansion >= 1.00 or speed >= 0.80 or abs(structure_trend) > 0.0)
+    )
 
     phase = "comfort"
-    if expiry_proximity >= 0.84 and band_concentration >= 0.50 and abs(option_skew) >= 0.08:
+    market_expiry_pressure = bool(expiry_proximity >= 0.95 and (compression >= 1.20 or wick >= 0.82))
+    market_exhaustion = bool(overlap >= 0.62 and idle >= 10 and (compression >= 1.15 or shock <= 0.12))
+    market_late_entry = bool(expansion >= 1.15 and speed >= 1.05 and (abs(float(features.get("direction_persistence", 0.0))) >= 0.20 or shock >= 0.18))
+
+    if failed_high_break or failed_low_break or zone_failed_rejection:
+        phase = "transfer"
+    elif (expiry_proximity >= 0.84 and band_concentration >= 0.50 and abs(option_skew) >= 0.08) or market_expiry_pressure:
         phase = "expiry_pain"
+    elif zone_breakout_acceptance:
+        phase = "exit_pain"
+    elif (accepted_high_break or accepted_low_break) and expansion >= 1.05 and speed >= 0.80 and compression <= 1.15:
+        phase = "exit_pain"
     elif shock >= 0.55 and expansion >= 1.35 and compression <= 0.95:
         phase = "exit_pain"
     elif trap >= 0.5 or (flip and sweep >= 0.5):
         phase = "transfer"
     elif compression >= 1.25 and overlap >= 0.60 and idle >= 8:
         phase = "digestion"
-    elif overlap >= 0.62 and idle >= 10 and (decay_ce >= 0.01 or decay_pe >= 0.01):
+    elif overlap >= 0.62 and idle >= 10 and ((decay_ce >= 0.01 or decay_pe >= 0.01) or market_exhaustion):
         phase = "exhaustion_pain"
-    elif expansion >= 1.15 and speed >= 1.05 and max(burst_ce, burst_pe) >= 1.2:
+    elif expansion >= 1.15 and speed >= 1.05 and (max(burst_ce, burst_pe) >= 1.2 or market_late_entry):
         phase = "late_entry"
     elif idle >= 4 or wick >= 0.92:
         phase = "discomfort"
@@ -701,7 +1088,23 @@ def classify_from_rules(
     next_group = "none"
     guidance = "no_edge"
 
-    if phase == "exit_pain":
+    if failed_high_break or (failed_above_supply and zone_failed_rejection):
+        dominant = "call_buyers"
+        next_group = "call_buyers"
+        guidance = "caution"
+    elif failed_low_break or (failed_below_demand and zone_failed_rejection):
+        dominant = "put_buyers"
+        next_group = "put_buyers"
+        guidance = "caution"
+    elif (breakout_from_demand or retest_acceptance > 0.0) and zone_breakout_acceptance:
+        dominant = "call_sellers"
+        next_group = "put_buyers"
+        guidance = "caution"
+    elif (breakdown_from_supply or retest_acceptance < 0.0) and zone_breakout_acceptance:
+        dominant = "put_sellers"
+        next_group = "call_buyers"
+        guidance = "caution"
+    elif phase == "exit_pain":
         if direction > 0:
             dominant = "call_sellers"
             next_group = "put_buyers"
@@ -782,6 +1185,28 @@ def classify_from_rules(
         elif option_next != "none" and option_next != next_group:
             confidence -= 0.08 * min(1.0, option_signal_consistency)
 
+    long_signal = next_group in {"put_buyers", "call_sellers"}
+    short_signal = next_group in {"call_buyers", "put_sellers"}
+    if (long_signal and structure_trend > 0.0) or (short_signal and structure_trend < 0.0):
+        confidence += 0.08 * min(1.0, structure_strength)
+    elif (long_signal and structure_trend < 0.0 and not failed_low_break) or (
+        short_signal and structure_trend > 0.0 and not failed_high_break
+    ):
+        confidence -= 0.12 * min(1.0, structure_strength)
+
+    if zone_failed_rejection:
+        confidence += 0.09
+    elif failed_high_break or failed_low_break:
+        confidence += 0.08
+    elif zone_breakout_acceptance:
+        confidence += 0.06
+    elif (retest_acceptance > 0.0 and next_group == "put_buyers") or (
+        retest_acceptance < 0.0 and next_group == "call_buyers"
+    ):
+        confidence += 0.05
+    elif (accepted_high_break and next_group == "put_buyers") or (accepted_low_break and next_group == "call_buyers"):
+        confidence += 0.05
+
     confidence = _clamp(confidence, 0.0, 1.0)
     trade_plan = derive_trade_plan(
         features=features,
@@ -825,6 +1250,12 @@ def build_explanation(
     option_consistency = float(features.get("option_signal_consistency", 0.0))
     option_quality = float(features.get("option_data_quality", 0.0))
     option_skew = float(features.get("option_skew_balance", 0.0))
+    breakout_from_demand = float(features.get("breakout_from_demand", 0.0)) >= 0.5
+    breakdown_from_supply = float(features.get("breakdown_from_supply", 0.0)) >= 0.5
+    failed_above_supply = float(features.get("failed_break_above_supply", 0.0)) >= 0.5
+    failed_below_demand = float(features.get("failed_break_below_demand", 0.0)) >= 0.5
+    price_in_demand = float(features.get("price_in_demand_zone", 0.0)) >= 0.5
+    price_in_supply = float(features.get("price_in_supply_zone", 0.0)) >= 0.5
 
     lines = [
         f"pain_phase is {pain_phase}.",
@@ -839,9 +1270,12 @@ def build_explanation(
         else:
             lines.append("Fast movement is creating exit pain among crowded participants.")
     elif pain_phase in {"digestion", "exhaustion_pain"}:
-        lines.append(
-            "Sideways time pressure is creating premium bleed; buyers_both feel time pain while sellers stay in comfort."
-        )
+        if decay_ce > 0.0 or decay_pe > 0.0:
+            lines.append(
+                "Sideways time pressure is creating premium bleed; buyers_both feel time pain while sellers stay in comfort."
+            )
+        else:
+            lines.append("Sideways time pressure and overlap are showing exhaustion without a clean release edge.")
     elif pain_phase == "transfer":
         lines.append("A quick trap and reversal is shifting pain from one buyer group to the other.")
     elif pain_phase == "expiry_pain":
@@ -856,9 +1290,24 @@ def build_explanation(
         else:
             lines.append("Balanced movement shows no clear pain transfer edge.")
 
-    lines.append(
-        f"guidance is {guidance}; candle_speed={speed:.2f}, overlap_ratio={overlap:.2f}, ce_decay={decay_ce:.3f}, pe_decay={decay_pe:.3f}."
-    )
+    if failed_above_supply:
+        lines.append("Price rejected above supply, so trapped call_buyers are the main pain group.")
+    elif failed_below_demand:
+        lines.append("Price rejected below demand, so trapped put_buyers are the main pain group.")
+    elif breakout_from_demand:
+        lines.append("Price accepted away from demand, supporting upward continuation pressure.")
+    elif breakdown_from_supply:
+        lines.append("Price accepted away from supply, supporting downward continuation pressure.")
+    elif price_in_demand or price_in_supply:
+        zone_name = "demand" if price_in_demand else "supply"
+        lines.append(f"Price is testing the active {zone_name} zone.")
+
+    if decay_ce > 0.0 or decay_pe > 0.0:
+        lines.append(
+            f"guidance is {guidance}; candle_speed={speed:.2f}, overlap_ratio={overlap:.2f}, ce_decay={decay_ce:.3f}, pe_decay={decay_pe:.3f}."
+        )
+    else:
+        lines.append(f"guidance is {guidance}; candle_speed={speed:.2f}, overlap_ratio={overlap:.2f}.")
     if option_quality > 0.0 or option_strength > 0.0:
         lines.append(
             f"option_flow_strength={option_strength:.2f}, option_consistency={option_consistency:.2f}, "

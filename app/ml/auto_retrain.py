@@ -1045,7 +1045,9 @@ class AutoRetrainService:
         try:
             conn = self._connect_mysql()
             candles = self._fetch_candles(conn, since_ts=since_ts, until_ts=now_ts)
-            options = self._fetch_options(conn, since_ts=since_ts, until_ts=now_ts)
+            # Auto-retrain is intentionally market-candle-only for AI features.
+            # Option snapshots remain available to other runtime flows.
+            options: List[Dict[str, Any]] = []
             trade_labels = self._fetch_trade_labels(
                 conn,
                 since_ts=since_ts,
@@ -1069,7 +1071,6 @@ class AutoRetrainService:
 
             with tempfile.TemporaryDirectory(prefix="pta_retrain_") as temp_dir:
                 candles_path = str(Path(temp_dir) / "candles_1m.csv")
-                options_path = str(Path(temp_dir) / "options.csv")
                 labels_path = str(Path(temp_dir) / "labels.csv")
                 self._write_csv(
                     candles_path,
@@ -1078,23 +1079,6 @@ class AutoRetrainService:
                 )
                 options_arg = ""
                 labels_arg = ""
-                if options:
-                    self._write_csv(
-                        options_path,
-                        options,
-                        [
-                            "timestamp",
-                            "atm_ce_ltp",
-                            "atm_pe_ltp",
-                            "atm_ce_volume",
-                            "atm_pe_volume",
-                            "atm_ce_oi_change",
-                            "atm_pe_oi_change",
-                            "band_volume_near_atm",
-                            "band_volume_total",
-                        ],
-                    )
-                    options_arg = options_path
                 if labels:
                     self._write_csv(
                         labels_path,

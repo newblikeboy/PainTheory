@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from bisect import bisect_right
 import csv
 import json
 import math
@@ -309,7 +308,6 @@ def _build_samples(
 
     samples: List[Dict[str, Any]] = []
     candles_5m_ts = [int(item["timestamp"]) for item in candles_5m]
-    options_ts = [int(_to_int(item.get("timestamp"), 0)) for item in options]
     last_phase = "comfort"
 
     for idx in range(len(candles_1m)):
@@ -319,17 +317,12 @@ def _build_samples(
         end_5m = available_higher_timeframe_end_index(candles_5m_ts, current_ts)
         if end_5m < window_5m:
             continue
-        end_opt = bisect_right(options_ts, current_ts) if options_ts else 0
-
         analysis_window = candles_5m[end_5m - window_5m : end_5m]
         execution_window = candles_1m[idx - window_1m + 1 : idx + 1]
-        option_window_analysis = options[max(0, end_opt - max(90, window_1m)) : end_opt] if end_opt else []
-        option_window_execution = options[max(0, end_opt - window_1m) : end_opt] if end_opt else []
         features = build_dual_timeframe_features(
             analysis_window,
             execution_window,
-            analysis_options=option_window_analysis,
-            execution_options=option_window_execution,
+            include_options=False,
         )
 
         row_label = labels.get(current_ts)
@@ -340,32 +333,27 @@ def _build_samples(
 
         # Train next_likely_pain_group on the actual future pain group.
         # This target means "who is likely in pain", not market direction.
-        future_idx = min(len(candles_1m) - 1, idx + max(1, next_horizon))
+        future_idx = idx + max(1, next_horizon)
+        if future_idx >= len(candles_1m):
+            break
         future_ts = int(candles_1m[future_idx]["timestamp"])
         future_end_5m = available_higher_timeframe_end_index(candles_5m_ts, future_ts)
-        future_end_opt = bisect_right(options_ts, future_ts) if options_ts else 0
         future_execution_window = candles_1m[max(0, future_idx - window_1m + 1) : future_idx + 1]
         future_analysis_window = candles_5m[max(0, future_end_5m - window_5m) : future_end_5m]
-        future_option_analysis = (
-            options[max(0, future_end_opt - max(90, window_1m)) : future_end_opt]
-            if future_end_opt
-            else []
-        )
-        future_option_execution = (
-            options[max(0, future_end_opt - window_1m) : future_end_opt]
-            if future_end_opt
-            else []
-        )
         future_features = build_dual_timeframe_features(
             future_analysis_window,
             future_execution_window,
-            analysis_options=future_option_analysis,
-            execution_options=future_option_execution,
+            include_options=False,
         )
         next_state = classify_from_rules(future_features, str(target_now.get("pain_phase", "comfort")))
         
         next_label = _normalize_label(
             str(next_state.get("dominant_pain_group", "none") or "none"),
+            PARTICIPANT_GROUPS,
+            "none",
+        )
+        current_entry_group = _normalize_label(
+            str(target_now.get("next_likely_pain_group", "none") or "none"),
             PARTICIPANT_GROUPS,
             "none",
         )
@@ -376,7 +364,7 @@ def _build_samples(
         derived_trigger, derived_stop, derived_target = _derive_trade_targets(
             current_close=_to_float(candles_1m[idx].get("close"), 0.0),
             future_window=future_window,
-            next_group=next_label,
+            next_group=current_entry_group,
             guidance=str(target_now.get("guidance", "observe")),
             features=features,
         )
@@ -483,12 +471,11 @@ def _build_matrix(
         features = row["features"]
         X.append([float(features.get(name, 0.0)) for name in feature_columns])
         timestamps.append(int(row["timestamp"]))
-        base_weight = _option_sample_weight(features)
         mistake_weight = _mistake_sample_weight(
             str(row.get("mistake_type", "none")),
             _to_float(row.get("mistake_score"), 0.0),
         )
-        sample_weights.append(float(base_weight) * float(mistake_weight))
+        sample_weights.append(float(mistake_weight))
         for target in TARGETS:
             y[target].append(str(row[target]))
         for target in REGRESSION_TARGETS:
@@ -500,19 +487,33 @@ def _date_split(
     X: List[List[float]],
     y_class: Dict[str, List[str]],
     y_reg: Dict[str, List[float]],
+    timestamps: List[int],
     sample_weights: List[float],
     test_size: float,
+    purge_horizon_sec: int,
 ):
     total = len(X)
     split_idx = int(total * (1.0 - test_size))
     split_idx = max(1, min(total - 1, split_idx))
-    X_train = X[:split_idx]
+    test_start_ts = int(timestamps[split_idx]) if timestamps else 0
+    train_end_idx = split_idx
+    if test_start_ts > 0 and purge_horizon_sec > 0:
+        cutoff_ts = test_start_ts - int(purge_horizon_sec)
+        train_end_idx = 0
+        for idx, ts in enumerate(timestamps[:split_idx]):
+            if int(ts) < cutoff_ts:
+                train_end_idx = idx + 1
+            else:
+                break
+        train_end_idx = max(1, min(split_idx, train_end_idx))
+
+    X_train = X[:train_end_idx]
     X_test = X[split_idx:]
-    y_train_class = {key: values[:split_idx] for key, values in y_class.items()}
+    y_train_class = {key: values[:train_end_idx] for key, values in y_class.items()}
     y_test_class = {key: values[split_idx:] for key, values in y_class.items()}
-    y_train_reg = {key: values[:split_idx] for key, values in y_reg.items()}
+    y_train_reg = {key: values[:train_end_idx] for key, values in y_reg.items()}
     y_test_reg = {key: values[split_idx:] for key, values in y_reg.items()}
-    w_train = sample_weights[:split_idx]
+    w_train = sample_weights[:train_end_idx]
     w_test = sample_weights[split_idx:]
     return X_train, X_test, y_train_class, y_test_class, y_train_reg, y_test_reg, w_train, w_test
 
@@ -631,7 +632,9 @@ def train(
         if candles_5m_path
         else _aggregate_5m_from_1m(candle_rows_1m)
     )
-    option_rows = _normalize_options(_load_table(options_path)) if options_path else []
+    # Option snapshots are intentionally ignored for AI training. They may still be
+    # collected and used by other runtime flows.
+    option_rows: List[Dict[str, Any]] = []
     label_rows = _label_maps(_load_table(labels_path)) if labels_path else {}
 
     samples = _build_samples(
@@ -646,24 +649,34 @@ def train(
     if len(samples) < 120:
         raise RuntimeError("Not enough samples to train (need at least 120 rolling samples).")
 
-    feature_columns = dual_feature_columns(include_base=True)
+    feature_columns = dual_feature_columns(include_base=True, include_options=False)
     X, y_class, y_reg, timestamps, sample_weights = _build_matrix(samples, feature_columns)
     X_train, X_test, y_train_class, y_test_class, y_train_reg, y_test_reg, w_train, w_test = _date_split(
         X,
         y_class,
         y_reg,
+        timestamps,
         sample_weights,
         test_size,
+        purge_horizon_sec=max(1, int(next_horizon)) * 60,
     )
 
     classifiers: Dict[str, Any] = {}
     encoders: Dict[str, LabelEncoder] = {}
     regressors: Dict[str, Any] = {}
+    split_idx = len(samples) - len(X_test)
+    train_to_ts = int(timestamps[len(X_train) - 1]) if X_train else 0
+    test_from_ts = int(timestamps[split_idx]) if timestamps and split_idx < len(timestamps) else 0
 
     metrics: Dict[str, Any] = {
         "rows": len(samples),
         "train_rows": len(X_train),
         "test_rows": len(X_test),
+        "purged_rows": max(0, len(samples) - len(X_train) - len(X_test)),
+        "purge_horizon_sec": max(1, int(next_horizon)) * 60,
+        "train_to_ts": train_to_ts,
+        "test_from_ts": test_from_ts,
+        "train_test_gap_sec": max(0, test_from_ts - train_to_ts) if train_to_ts and test_from_ts else 0,
         "targets": {},
         "regression_targets": {},
         "window_1m": window_1m,
@@ -674,7 +687,8 @@ def train(
         "to_ts": int(timestamps[-1]),
         "input_candles_1m": candles_1m_path,
         "input_candles_5m": candles_5m_path if candles_5m_path else "aggregated_from_1m",
-        "input_options": options_path if options_path else "",
+        "input_options": "ignored_for_ai" if options_path else "",
+        "input_options_rows_ignored": 0,
         "input_labels": labels_path if labels_path else "",
         "timeframe_alignment": "closed_only_start_timestamps",
         "next_likely_pain_group_schema": "future_dominant_pain_group_6class",
